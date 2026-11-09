@@ -1,0 +1,7 @@
+services:
+  relay:
+    build: ./server
+    env_file: .env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8000"   # наружу только через Caddy

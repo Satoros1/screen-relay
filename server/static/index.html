@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg:#0e0f12; --fg:#e8e8ea; --muted:#8a8d96; --ok:#2ecc71; --bad:#e74c3c; --warn:#f1c40f; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:14px/1.3 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #bar { position:fixed; top:0; left:0; right:0; display:flex; gap:12px; align-items:center;
+    padding:8px 12px; padding-top:max(8px, env(safe-area-inset-top));
+    background:rgba(0,0,0,.55); backdrop-filter:blur(6px); z-index:2; font-size:13px; }
+  #dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none; }
+  #state { font-weight:600; }
+  .muted { color:var(--muted); }
+  #spacer { flex:1; }
+  button { background:#2a2d35; color:var(--fg); border:0; border-radius:8px; padding:6px 10px; font:inherit; cursor:pointer; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { width:100%; height:100%; object-fit:contain; display:block; }
+  #stale { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+    background:rgba(0,0,0,.45); font-size:16px; z-index:1; pointer-events:none; }
+  #login { position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:3; background:var(--bg); }
+  #login form { display:flex; flex-direction:column; gap:10px; width:min(320px, 90vw); }
+  #login input { padding:10px; border-radius:8px; border:1px solid #333; background:#17191e; color:var(--fg); font:inherit; }
+  #login .err { color:var(--bad); min-height:1em; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div id="dot"></div><span id="state">Подключение…</span>
+  <span id="fps" class="muted"></span>
+  <span id="spacer"></span>
+  <button id="fs" title="Во весь экран">⛶</button>
+</div>
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="stale">Нет сигнала от ПК</div>
+<div id="login">
+  <form id="loginForm">
+    <div>Введите ключ доступа</div>
+    <input id="keyInput" type="password" autocomplete="current-password" required>
+    <button type="submit">Смотреть</button>
+    <div class="err" id="loginErr"></div>
+  </form>
+</div>
+
+<script>
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(tg && tg.initData);
+  if (inTelegram) { tg.ready(); tg.expand(); try { tg.setHeaderColor('#0e0f12'); tg.setBackgroundColor('#0e0f12'); } catch (e) {} }
+
+  const $ = id => document.getElementById(id);
+  const cv = $('cv'), ctx = cv.getContext('2d');
+  const KEY_STORE = 'relay_view_key';
+
+  const store = {
+    get() { try { return localStorage.getItem(KEY_STORE) || ''; } catch (e) { return memKey; } },
+    set(v) { memKey = v; try { localStorage.setItem(KEY_STORE, v); } catch (e) {} },
+    clear() { memKey = ''; try { localStorage.removeItem(KEY_STORE); } catch (e) {} },
+  };
+  let memKey = '';
+
+  let ws = null, backoff = 500, frames = 0, lastFrameAt = 0, decoding = false, pending = null;
+
+  function setState(text, color) { $('state').textContent = text; $('dot').style.background = color; }
+
+  async function draw(blob) {
+    if (decoding) { pending = blob; return; }   // keep only the newest frame
+    decoding = true;
+    try {
+      const bmp = await createImageBitmap(blob);
+      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close && bmp.close();
+      frames++; lastFrameAt = performance.now();
+    } catch (e) { /* broken frame, skip */ }
+    decoding = false;
+    if (pending) { const b = pending; pending = null; draw(b); }
+  }
+
+  function showLogin(msg) {
+    $('login').style.display = 'flex';
+    $('loginErr').textContent = msg || '';
+    $('keyInput').focus();
+  }
+
+  $('loginForm').addEventListener('submit', e => {
+    e.preventDefault();
+    store.set($('keyInput').value.trim());
+    $('login').style.display = 'none';
+    connect();
+  });
+
+  function connect() {
+    let auth;
+    if (inTelegram) auth = { initData: tg.initData };
+    else {
+      const k = store.get();
+      if (!k) { showLogin(); return; }
+      auth = { key: k };
+    }
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = 'blob';
+    let authed = false;
+
+    ws.onopen = () => ws.send(JSON.stringify(auth));
+    ws.onmessage = ev => {
+      if (typeof ev.data !== 'string') { draw(ev.data); return; }
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'auth') {
+        if (!m.ok) {
+          authed = false;
+          if (m.reason === 'full') { setState('Слишком много зрителей', 'var(--bad)'); return; }
+          if (inTelegram) { setState('Нет доступа', 'var(--bad)'); return; }
+          store.clear(); showLogin('Неверный ключ'); return;
+        }
+        authed = true; backoff = 500; setState('Ожидание кадров…', 'var(--warn)');
+      } else if (m.type === 'status') {
+        const live = m.online && m.age !== null && m.age < 5;
+        setState(live ? 'LIVE' : (m.online ? 'ПК подключён, нет кадров' : 'ПК не в сети'),
+                 live ? 'var(--ok)' : 'var(--bad)');
+        $('stale').style.display = live ? 'none' : 'flex';
+      }
+    };
+    ws.onclose = ev => {
+      ws = null;
+      if (ev.code === 4403 || ev.code === 4429) return;   // handled above
+      setState('Переподключение…', 'var(--warn)');
+      setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 10000);
+    };
+  }
+
+  setInterval(() => {
+    $('fps').textContent = frames ? `${frames} fps` : '';
+    frames = 0;
+  }, 1000);
+
+  $('fs').addEventListener('click', () => {
+    if (inTelegram && tg.requestFullscreen) { try { tg.isFullscreen ? tg.exitFullscreen() : tg.requestFullscreen(); return; } catch (e) {} }
+    const el = document.documentElement;
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !ws) connect();
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

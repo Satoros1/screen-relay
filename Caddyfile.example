@@ -1,0 +1,8 @@
+# Добавь в свой Caddyfile. WebSocket Caddy проксирует сам.
+live.example.com {
+    encode gzip
+    reverse_proxy 127.0.0.1:8090
+}
+
+# Если Caddy тоже в Docker и в одной сети с relay:
+#     reverse_proxy relay:8000
