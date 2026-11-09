@@ -38,11 +38,20 @@ jobs:
       - name: Test self-update (replace exe + restart)
         working-directory: desktop
         shell: pwsh
+        timeout-minutes: 4
         run: |
-          Start-Process -FilePath dist\ScreenRelay.exe -ArgumentList "--selftest-swap" -Wait
-          for ($i = 0; $i -lt 60 -and -not (Test-Path dist\swap-ok.txt); $i++) { Start-Sleep -Seconds 1 }
-          if (-not (Test-Path dist\swap-ok.txt)) { throw "updated exe did not start" }
+          Start-Process -FilePath dist\ScreenRelay.exe -ArgumentList "--selftest-swap"
+          for ($i = 0; $i -lt 90 -and -not (Test-Path dist\swap-ok.txt); $i++) { Start-Sleep -Seconds 1 }
+          $ok = Test-Path dist\swap-ok.txt
+          if (-not $ok) {
+            Write-Host "--- swap-error.txt"; Get-Content dist\swap-error.txt -ErrorAction SilentlyContinue
+            Write-Host "--- update log";     Get-Content "$env:TEMP\ScreenRelay-update.log" -ErrorAction SilentlyContinue
+            Write-Host "--- processes";      Get-Process ScreenRelay, powershell -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, MainWindowTitle
+            Get-ChildItem dist
+            throw "updated exe did not start"
+          }
           Start-Sleep -Seconds 2
+          Get-Content "$env:TEMP\ScreenRelay-update.log"
           if (Test-Path dist\ScreenRelay.update.exe) { throw "update file was not moved into place" }
           Remove-Item dist\swap-ok.txt, dist\selftest.log -ErrorAction SilentlyContinue
           Write-Host "self-update works"

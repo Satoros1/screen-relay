@@ -175,20 +175,24 @@ def launch_swap_and_restart(new_exe: Path, args: list[str]) -> None:
     def q(x):
         return "'" + str(x).replace("'", "''") + "'"
     old = Path(sys.executable)
+    log = Path(os.environ.get("TEMP", str(old.parent))) / "ScreenRelay-update.log"
     arglist = ",".join(q(a) for a in args) if args else "@()"
     script = f"""
-$old = {q(old)}; $new = {q(new_exe)}
+$old = {q(old)}; $new = {q(new_exe)}; $log = {q(log)}
+"$(Get-Date -Format s) start" | Out-File -LiteralPath $log -Encoding utf8
 for ($i = 0; $i -lt 120; $i++) {{
-  try {{ Move-Item -LiteralPath $new -Destination $old -Force -ErrorAction Stop; break }}
+  try {{ Move-Item -LiteralPath $new -Destination $old -Force -ErrorAction Stop; "moved after $i tries" | Out-File -LiteralPath $log -Append -Encoding utf8; break }}
   catch {{ Start-Sleep -Milliseconds 500 }}
 }}
-Start-Process -FilePath $old -ArgumentList {arglist}
+try {{ Start-Process -FilePath $old -ArgumentList {arglist} -ErrorAction Stop; "restarted" | Out-File -LiteralPath $log -Append -Encoding utf8 }}
+catch {{ "restart failed: $_" | Out-File -LiteralPath $log -Append -Encoding utf8 }}
 """
     encoded = base64.b64encode(script.encode("utf-16-le")).decode()
     subprocess.Popen(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
          "-EncodedCommand", encoded],
         creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         close_fds=True,
     )
 
@@ -1167,9 +1171,13 @@ def main():
         sys.exit(selftest())
     if "--selftest-swap" in sys.argv:          # CI: exercise the real update/restart path
         import shutil
-        new = Path(sys.executable).with_name("ScreenRelay.update.exe")
-        shutil.copyfile(sys.executable, new)
-        launch_swap_and_restart(new, ["--selftest-marker"])
+        import traceback
+        try:
+            new = Path(sys.executable).with_name("ScreenRelay.update.exe")
+            shutil.copyfile(sys.executable, new)
+            launch_swap_and_restart(new, ["--selftest-marker"])
+        except Exception:
+            Path(sys.executable).with_name("swap-error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         return
     if "--selftest-marker" in sys.argv:
         Path(sys.executable).with_name("swap-ok.txt").write_text(APP_VERSION, encoding="utf-8")
