@@ -39,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -56,6 +56,9 @@ DEFAULTS = {
     "max_width": "1280",
     "start_on_launch": False,
     "minimize_to_tray": True,
+    "emulator_shortcut": "",     # BlueStacks app shortcut (.lnk) to (re)start the emulator with the app
+    "auto_launch": True,         # start it by itself when the window is missing
+    "keep_awake": True,          # don't let the PC sleep / turn the screen off while streaming
 }
 
 
@@ -413,11 +416,13 @@ class WindowSource:
         self.black_count = 0
         self.retry_print_at = 0.0
         self.last_find = 0.0
+        self.missing_since = None     # monotonic time since the window can't be found
 
     def grab(self, title: str, sct) -> tuple[Image.Image | None, str]:
         if not title:
             return None, "Выбери окно"
         if title == SCREEN or not IS_WIN:
+            self.missing_since = None
             mon = sct.monitors[1]
             shot = sct.grab(mon)
             return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX"), "Захват: весь экран"
@@ -430,7 +435,10 @@ class WindowSource:
             self.hwnd = find_window(title)
             self.mode, self.black_count = "print", 0
             if self.hwnd is None:
+                if self.missing_since is None:
+                    self.missing_since = time.monotonic()
                 return None, f"Окно «{title}» не найдено - жду…"
+            self.missing_since = None
 
         if user32.IsIconic(self.hwnd):
             user32.ShowWindow(self.hwnd, 4)    # SW_SHOWNOACTIVATE - unminimize without stealing focus
@@ -602,6 +610,71 @@ class Net(threading.Thread):
             backoff = min(backoff * 2, 30)
 
 
+# ============================================================ emulator / power
+def set_keep_awake(on: bool) -> None:
+    """Keep the PC awake and the screen on (only while we are streaming)."""
+    if not IS_WIN:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.SetThreadExecutionState.argtypes = [W.DWORD]
+        k32.SetThreadExecutionState.restype = W.DWORD
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x1, 0x2
+        k32.SetThreadExecutionState(ES_CONTINUOUS | ((ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) if on else 0))
+    except Exception:
+        pass
+
+
+def find_emulator_shortcuts() -> list[dict]:
+    """BlueStacks shortcuts on the desktop / in the Start menu: [{"name", "path", "app"}]."""
+    if not IS_WIN:
+        return []
+    import tempfile
+    out = Path(tempfile.gettempdir()) / "ScreenRelay-shortcuts.json"
+    out.unlink(missing_ok=True)
+    run_powershell(f"""
+$sh = New-Object -ComObject WScript.Shell
+$dirs = @('Desktop','CommonDesktopDirectory','Programs','CommonPrograms') | ForEach-Object {{ [Environment]::GetFolderPath($_) }}
+$res = @()
+foreach ($d in $dirs) {{
+  if (-not $d -or -not (Test-Path -LiteralPath $d)) {{ continue }}
+  Get-ChildItem -LiteralPath $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue | ForEach-Object {{
+    try {{
+      $l = $sh.CreateShortcut($_.FullName)
+      if ($l.TargetPath -match 'HD-Player\\.exe|HD-RunApp\\.exe') {{
+        $res += [pscustomobject]@{{ name = $_.BaseName; path = $_.FullName; args = $l.Arguments }}
+      }}
+    }} catch {{}}
+  }}
+}}
+ConvertTo-Json -InputObject @($res) -Compress | Out-File -LiteralPath {ps_quote(out)} -Encoding utf8
+""", wait=True)
+    try:
+        items = json.loads(out.read_text(encoding="utf-8-sig") or "[]")
+    except Exception:
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    seen, result = set(), []
+    for it in items:
+        if it.get("path") in seen:
+            continue
+        seen.add(it.get("path"))
+        args = (it.get("args") or "").lower()
+        is_app = "launchapp" in args or "package" in args or "app_pkg" in args
+        result.append({"name": it.get("name", "?"), "path": it.get("path", ""), "app": is_app})
+    result.sort(key=lambda x: (not x["app"], x["name"].lower()))     # app shortcuts first
+    return result
+
+
+def launch_shortcut(path: str) -> None:
+    if not IS_WIN:
+        raise RuntimeError("только на Windows")
+    if not Path(path).exists():
+        raise RuntimeError("ярлык не найден - выбери его заново")
+    os.startfile(path)   # noqa - Windows only
+
+
 # ============================================================ autostart
 def startup_dir() -> Path:
     return Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
@@ -660,13 +733,17 @@ class App:
         self.tray_state = None
         self.hint_shown = False
         self.updater = Updater(self.ui_q.put)
+        self.shortcuts: dict[str, str] = {}
+        self.last_launch = -1e9
+        self.last_wall = time.time()
         self.can_update = IS_WIN and getattr(sys, "frozen", False)
 
         root.title(f"{APP_NAME} {APP_VERSION}")
         self.win_icon = ImageTk.PhotoImage(make_icon("#27ae60"))
         root.iconphoto(True, self.win_icon)
-        root.geometry("820x720")
-        root.minsize(640, 560)
+        h = max(600, min(840, root.winfo_screenheight() - 90))   # fits small laptop screens
+        root.geometry(f"840x{h}")
+        root.minsize(700, 600)
         self._build()
         self.refresh_windows()
         self.setup_tray()
@@ -688,6 +765,8 @@ class App:
             self.notify(f"Обновлено до версии {APP_VERSION}")
         if self.can_update:
             root.after(5000, self.auto_check)
+        if IS_WIN and not self.cfg["emulator_shortcut"]:
+            root.after(800, self.detect_shortcuts)
 
     # ---------------------------------------------------- layout
     def _build(self):
@@ -713,7 +792,7 @@ class App:
         ttk.Button(conn, text="👁 Показать", command=self.toggle_token).grid(row=1, column=2, padx=6, sticky="ew")
         hint = ttk.Frame(conn)
         hint.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 4))
-        self.code_label = ttk.Label(hint, foreground="#666",
+        self.code_label = ttk.Label(hint, foreground="#666", wraplength=620,
                                     text="Есть код подключения sr1:… от setup.sh? Вставь его в поле «Адрес» или нажми →")
         self.code_label.pack(side="left")
         ttk.Button(hint, text="📋 Вставить код", command=self.paste_code).pack(side="right")
@@ -767,6 +846,32 @@ class App:
         self.server_var.trace_add("write", lambda *a: self.on_server_typed())
         self.token_var.trace_add("write", lambda *a: self.on_option())
 
+        emu = ttk.LabelFrame(self.root, text="Автовосстановление (BlueStacks)")
+        emu.pack(fill="x", **pad)
+        row = ttk.Frame(emu)
+        row.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(row, text="Ярлык приложения:").pack(side="left")
+        self.sc_var = tk.StringVar(value=Path(self.cfg["emulator_shortcut"]).stem if self.cfg["emulator_shortcut"] else "")
+        self.sc_box = ttk.Combobox(row, textvariable=self.sc_var, state="readonly")
+        self.sc_box.pack(side="left", fill="x", expand=True, padx=6)
+        self.sc_box.bind("<<ComboboxSelected>>", self.on_shortcut_selected)
+        ttk.Button(row, text="Найти", command=self.detect_shortcuts).pack(side="left")
+        ttk.Button(row, text="Файл…", command=self.pick_shortcut).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="▶ Проверить", command=lambda: self.launch_emulator("проверка")).pack(side="left", padx=(4, 0))
+        self.launch_var = tk.BooleanVar(value=self.cfg["auto_launch"])
+        ttk.Checkbutton(emu, text="Если окна нет (ПК включили, BlueStacks закрылся) - запускать его самому",
+                        variable=self.launch_var, command=self.on_option).pack(anchor="w", padx=6)
+        self.emu_label = ttk.Label(emu, foreground="#666", wraplength=780,
+                                   text="Ярлык создаётся в BlueStacks: долгое нажатие на иконку приложения → "
+                                        "«Desktop shortcut». Потом «Найти».")
+        self.emu_label.pack(anchor="w", padx=6, pady=(0, 4))
+        if not IS_WIN:
+            for w in row.winfo_children():
+                try:
+                    w.state(["disabled"])
+                except Exception:
+                    pass
+
         bottom = ttk.Frame(self.root)
         bottom.pack(fill="x", **pad)
         upd = ttk.Frame(bottom)
@@ -784,6 +889,9 @@ class App:
         cb.pack(anchor="w")
         if not pystray:
             cb.state(["disabled"])
+        self.awake_var = tk.BooleanVar(value=self.cfg["keep_awake"])
+        ttk.Checkbutton(bottom, text="Не давать ПК засыпать и гасить экран во время трансляции",
+                        variable=self.awake_var, command=self.on_awake).pack(anchor="w")
         if IS_WIN:
             self.boot_var = tk.BooleanVar(value=autostart_enabled())
             ttk.Checkbutton(bottom, text="Запускать вместе с Windows",
@@ -793,6 +901,7 @@ class App:
         bar.pack(fill="x", padx=8, pady=(4, 10))
         self.btn = ttk.Button(bar, text="▶  Начать трансляцию", style="Big.TButton", command=self.toggle)
         self.btn.pack(side="left")
+        ttk.Button(bar, text="🔄 Восстановить", style="Big.TButton", command=self.restore).pack(side="left", padx=(6, 0))
         st = ttk.Frame(bar)
         st.pack(side="left", fill="x", expand=True, padx=12)
         self.state_label = tk.Label(st, text="● Остановлено", fg="#888", font=("Segoe UI", 11, "bold"), anchor="w")
@@ -801,6 +910,14 @@ class App:
         self.info_label.pack(fill="x")
         self.update_area_label()
         self.q_label.config(text=str(self.q_var.get()))
+
+        # buttons and options always stay visible; the preview takes whatever height is left
+        for w in (src, emu, bottom, bar):
+            w.pack_forget()
+        bar.pack(side="bottom", fill="x", padx=8, pady=(4, 10))
+        bottom.pack(side="bottom", fill="x", **pad)
+        emu.pack(side="bottom", fill="x", **pad)
+        src.pack(fill="both", expand=True, **pad)
 
     # ---------------------------------------------------- settings
     def toggle_token(self):
@@ -822,6 +939,8 @@ class App:
         self.cfg.update(fps=fps, quality=q, max_width=self.w_var.get(),
                         start_on_launch=bool(self.auto_var.get()),
                         minimize_to_tray=bool(self.tray_var.get()),
+                        auto_launch=bool(self.launch_var.get()),
+                        keep_awake=bool(self.awake_var.get()),
                         server=self.server_var.get().strip(), token=self.token_var.get().strip())
         self.push_cfg()
 
@@ -1011,6 +1130,7 @@ class App:
             w.config(state="disabled")
         self.last_stats = (time.monotonic(), 0, 0)
         self.update_tray("connecting")
+        set_keep_awake(self.cfg["keep_awake"])
 
     def stop(self):
         if self.net:
@@ -1023,12 +1143,18 @@ class App:
         self.set_state("Остановлено", "#888")
         self.info_label.config(text="")
         self.update_tray("stopped")
+        set_keep_awake(False)
 
     def set_state(self, text, color):
         self.state_label.config(text=f"● {text}", fg=color)
 
     def tick_status(self):
         try:
+            wall = time.time()
+            if self.net and wall - self.last_wall > 20:     # the PC was asleep - reconnect right away
+                self.reconnect("ПК проснулся - переподключаюсь")
+            self.last_wall = wall
+            self.maybe_launch_emulator()
             net = self.net
             src_status = self.cap.status
             if net:
@@ -1055,6 +1181,104 @@ class App:
         finally:
             self.root.after(1000, self.tick_status)
 
+    # ---------------------------------------------------- emulator / recovery
+    def detect_shortcuts(self):
+        if not IS_WIN:
+            return
+        self.emu_label.config(text="Ищу ярлыки BlueStacks…", foreground="#666")
+
+        def work():
+            try:
+                found = find_emulator_shortcuts()
+            except Exception:
+                found = []
+            self.ui_q.put(lambda: self.on_shortcuts_found(found))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_shortcuts_found(self, found):
+        self.shortcuts = {f["name"]: f["path"] for f in found}
+        cur = self.cfg["emulator_shortcut"]
+        if cur and Path(cur).stem not in self.shortcuts:
+            self.shortcuts[Path(cur).stem] = cur
+        self.sc_box["values"] = list(self.shortcuts)
+        if not found:
+            self.emu_label.config(text="Ярлыки BlueStacks не найдены. В BlueStacks: долгое нажатие на иконку "
+                                       "приложения → Desktop shortcut, потом «Найти».", foreground="#e67e22")
+            return
+        self.emu_label.config(text=f"Найдено ярлыков: {len(found)}. Выбери тот, что открывает нужное приложение.",
+                              foreground="#666")
+        if not cur:
+            first = found[0]
+            self.sc_var.set(first["name"])
+            self.on_shortcut_selected()
+
+    def on_shortcut_selected(self, _=None):
+        path = self.shortcuts.get(self.sc_var.get(), "")
+        if path:
+            self.cfg["emulator_shortcut"] = path
+            self.emu_label.config(text=f"Будет запускаться: {path}", foreground="#666")
+            self.push_cfg()
+
+    def pick_shortcut(self):
+        from tkinter import filedialog
+        desktop = Path.home() / "Desktop"
+        path = filedialog.askopenfilename(
+            title="Ярлык приложения BlueStacks", initialdir=str(desktop if desktop.exists() else Path.home()),
+            filetypes=[("Ярлык или программа", "*.lnk *.exe"), ("Все файлы", "*.*")])
+        if path:
+            path = str(Path(path))
+            self.shortcuts[Path(path).stem] = path
+            self.sc_box["values"] = list(self.shortcuts)
+            self.sc_var.set(Path(path).stem)
+            self.on_shortcut_selected()
+
+    def launch_emulator(self, why: str) -> bool:
+        path = self.cfg.get("emulator_shortcut")
+        if not path:
+            self.emu_label.config(text="Сначала выбери ярлык приложения", foreground="#e74c3c")
+            return False
+        try:
+            launch_shortcut(path)
+        except Exception as e:
+            self.emu_label.config(text=f"Не удалось запустить: {e}", foreground="#e74c3c")
+            return False
+        self.last_launch = time.monotonic()
+        self.emu_label.config(text=f"Запустил BlueStacks ({why}) в {time.strftime('%H:%M')}", foreground="#27ae60")
+        return True
+
+    def maybe_launch_emulator(self):
+        if not (IS_WIN and self.net and self.cfg.get("auto_launch") and self.cfg.get("emulator_shortcut")):
+            return
+        since = self.cap.src.missing_since
+        now = time.monotonic()
+        if since and now - since > 15 and now - self.last_launch > 180:
+            self.launch_emulator("окна не было")
+
+    def reconnect(self, why: str):
+        self.cap.src.hwnd = None            # look for the window again
+        if self.net:
+            self.net.stop()
+            self.net = Net(self.cap, self.cfg["server"], self.cfg["token"])
+            self.net.start()
+            self.last_stats = (time.monotonic(), 0, 0)
+        self.set_state(why, "#e67e22")
+
+    def restore(self):
+        """One button: (re)start BlueStacks with the app, find the window, reconnect, start streaming."""
+        if IS_WIN and self.cfg.get("emulator_shortcut"):
+            self.launch_emulator("кнопка «Восстановить»")
+        if self.net:
+            self.reconnect("Восстанавливаю связь…")
+        else:
+            self.cap.src.hwnd = None
+            self.start()
+
+    def on_awake(self):
+        self.on_option()
+        if self.net:
+            set_keep_awake(self.cfg["keep_awake"])
+
     # ---------------------------------------------------- tray / window
     def setup_tray(self):
         if not pystray:
@@ -1065,6 +1289,7 @@ class App:
                 pystray.MenuItem("Открыть", lambda i, it: post(self.show_window), default=True),
                 pystray.MenuItem(lambda it: "Остановить трансляцию" if self.net else "Начать трансляцию",
                                  lambda i, it: post(self.toggle)),
+                pystray.MenuItem("🔄 Восстановить", lambda i, it: post(self.restore)),
                 pystray.MenuItem(lambda it: f"Обновить до {self.updater.latest['version']}"
                                  if self.updater.latest else "Проверить обновления",
                                  lambda i, it: post(self.check_updates)),
@@ -1254,7 +1479,24 @@ def selftest() -> int:
             assert startup_file().exists(), "autostart shortcut not created"
             set_autostart(False)
             assert not startup_file().exists(), "autostart shortcut not removed"
-            extra = " autostart=ok"
+            # fake BlueStacks app shortcut on the desktop -> must be found and flagged as an app shortcut
+            import tempfile
+            fake = Path(tempfile.gettempdir()) / "fakebs" / "HD-Player.exe"
+            fake.parent.mkdir(exist_ok=True)
+            fake.write_bytes(b"MZ")
+            run_powershell(
+                "$d = [Environment]::GetFolderPath('Desktop'); New-Item -ItemType Directory -Force -Path $d | Out-Null; "
+                "$s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'SR Test App.lnk')); "
+                f"$s.TargetPath = {ps_quote(fake)}; $s.Arguments = '--instance Pie64 --cmd launchApp --package com.test'; $s.Save()",
+                wait=True)
+            found = find_emulator_shortcuts()
+            hit = [f for f in found if f["name"] == "SR Test App"]
+            for f in hit:
+                Path(f["path"]).unlink(missing_ok=True)
+            assert hit and hit[0]["app"], f"shortcut detection failed: {found}"
+            set_keep_awake(True)
+            set_keep_awake(False)
+            extra = " autostart=ok shortcuts=ok"
         log.write_text(f"OK windows={len(titles)} tray={pystray.Icon.__module__}{extra}\n", encoding="utf-8")
         return 0
     except Exception as e:

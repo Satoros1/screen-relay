@@ -76,6 +76,11 @@ else
   c_ok "DNS: $DOMAIN → $DNS_IP"
 fi
 
+# the site must survive VPS reboots: docker starts on boot, container has restart: unless-stopped
+if command -v systemctl >/dev/null && ! systemctl is-enabled --quiet docker 2>/dev/null; then
+  $SUDO systemctl enable docker >/dev/null 2>&1 && c_ok "Docker включён в автозапуск" || true
+fi
+
 echo "== Сборка и запуск контейнера =="
 $DOCKER compose up -d --build
 for i in $(seq 1 20); do
