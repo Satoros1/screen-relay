@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -39,6 +40,12 @@ STATUS_EVERY = 2.0
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 UPDATE_REPO = os.environ.get("UPDATE_REPO", "Satoros1/screen-relay")
 EXE_NAME = "ScreenRelay.exe"
+# Telegram: menu button that opens the Mini App + alerts when the stream goes down
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+SET_MENU_BUTTON = os.environ.get("SET_MENU_BUTTON", "1") != "0"
+ALERTS = os.environ.get("ALERTS", "1") != "0"
+ALERT_AFTER = int(os.environ.get("ALERT_AFTER", 60))   # seconds a state must last before we alert
+TG_API = os.environ.get("TG_API", "https://api.telegram.org")
 
 if len(PUSH_TOKEN) < 16:
     raise SystemExit("PUSH_TOKEN не задан или короче 16 символов")
@@ -46,7 +53,89 @@ if not VIEW_KEY and not (BOT_TOKEN and ALLOWED_IDS):
     raise SystemExit("Нужен VIEW_KEY и/или BOT_TOKEN + ALLOWED_IDS, иначе никто не сможет смотреть")
 
 STATIC = Path(__file__).parent / "static"
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# ------------------------------------------------------------ telegram
+async def tg(method: str, payload: dict) -> dict | None:
+    if not BOT_TOKEN:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{TG_API}/bot{BOT_TOKEN}/{method}", json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            log.warning("Telegram %s: %s", method, data.get("description"))
+        return data
+    except Exception as e:
+        log.warning("Telegram %s недоступен: %s", method, e)
+        return None
+
+
+def watch_button() -> dict | None:
+    if not PUBLIC_URL.startswith("https://"):
+        return None
+    return {"inline_keyboard": [[{"text": "📺 Смотреть", "web_app": {"url": PUBLIC_URL + "/"}}]]}
+
+
+async def setup_menu_button():
+    if BOT_TOKEN and SET_MENU_BUTTON and PUBLIC_URL.startswith("https://"):
+        res = await tg("setChatMenuButton", {"menu_button": {
+            "type": "web_app", "text": "📺 Live", "web_app": {"url": PUBLIC_URL + "/"}}})
+        if res and res.get("ok"):
+            log.info("кнопка Mini App в боте настроена: %s", PUBLIC_URL)
+
+
+def stream_state() -> str:
+    if not hub.publisher_online:
+        return "offline"
+    if not hub.frame_ts or time.time() - hub.frame_ts > 30:
+        return "no_frames"
+    return "live"
+
+
+ALERT_TEXT = {
+    "offline": "🔴 Трансляция прервалась: ПК с эмулятором не на связи.",
+    "no_frames": "🟠 ПК на связи, но кадров нет: окно эмулятора не найдено или закрыто.",
+    "live": "🟢 Трансляция снова идёт.",
+}
+
+
+async def watchdog():
+    """Message ALLOWED_IDS when the stream goes down / comes back (after ALERT_AFTER seconds)."""
+    reported = None              # nothing is reported until the stream has been live once
+    candidate, since = None, time.time()
+    while True:
+        await asyncio.sleep(5)
+        st = stream_state()
+        if st != candidate:
+            candidate, since = st, time.time()
+        if reported is None:
+            if st == "live":
+                reported = "live"
+            continue
+        if candidate != reported and time.time() - since >= ALERT_AFTER:
+            reported = candidate
+            log.info("состояние трансляции: %s", candidate)
+            for uid in ALLOWED_IDS:
+                payload = {"chat_id": uid, "text": ALERT_TEXT[candidate]}
+                if candidate == "live" and watch_button():
+                    payload["reply_markup"] = watch_button()
+                await tg("sendMessage", payload)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    tasks = []
+    if BOT_TOKEN:
+        tasks.append(asyncio.create_task(setup_menu_button()))
+        if ALERTS and ALLOWED_IDS:
+            tasks.append(asyncio.create_task(watchdog()))
+    yield
+    for t in tasks:
+        t.cancel()
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 def same(a: str, b: str) -> bool:

@@ -24,6 +24,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+import webbrowser
 from pathlib import Path
 from tkinter import ttk
 
@@ -38,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -87,6 +88,39 @@ def server_http_base(ws_url: str) -> str | None:
     if not m:
         return None
     return ("https" if m.group(1) == "wss" else "http") + "://" + m.group(2)
+
+
+def decode_code(text: str) -> tuple[str, str] | None:
+    """'sr1:<base64url json {"s": server, "t": token}>' from deploy/setup.sh -> (server, token)."""
+    text = (text or "").strip()
+    if not text.startswith("sr1:"):
+        return None
+    try:
+        raw = text[4:].strip()
+        data = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        server, token = str(data["s"]).strip(), str(data["t"]).strip()
+        if server.startswith(("ws://", "wss://")) and token:
+            return server, token
+    except Exception:
+        pass
+    return None
+
+
+def ps_quote(x) -> str:
+    return "'" + str(x).replace("'", "''") + "'"
+
+
+def run_powershell(script: str, wait: bool, env: dict | None = None):
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+           "-EncodedCommand", encoded]
+    kw = dict(creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              close_fds=True, env=env)
+    if wait:
+        return subprocess.run(cmd, timeout=30, **kw).returncode
+    subprocess.Popen(cmd, **kw)
+    return None
 
 
 class Updater:
@@ -172,8 +206,7 @@ class Updater:
 
 def launch_swap_and_restart(new_exe: Path, args: list[str]) -> None:
     """Hidden PowerShell waits until we exit, replaces the exe and starts the new one."""
-    def q(x):
-        return "'" + str(x).replace("'", "''") + "'"
+    q = ps_quote
     old = Path(sys.executable)
     log = Path(os.environ.get("TEMP", str(old.parent))) / "ScreenRelay-update.log"
     arglist = ",".join(q(a) for a in args) if args else "@()"
@@ -187,17 +220,10 @@ for ($i = 0; $i -lt 120; $i++) {{
 try {{ Start-Process -FilePath $old -ArgumentList {arglist} -ErrorAction Stop; "restarted" | Out-File -LiteralPath $log -Append -Encoding utf8 }}
 catch {{ "restart failed: $_" | Out-File -LiteralPath $log -Append -Encoding utf8 }}
 """
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
     # the new exe must start as an independent app, not as a child of this PyInstaller bootloader
     env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI_", "_MEIPASS"))}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-         "-EncodedCommand", encoded],
-        creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        close_fds=True, env=env,
-    )
+    run_powershell(script, wait=False, env=env)
 
 
 # ============================================================ settings
@@ -577,23 +603,39 @@ class Net(threading.Thread):
 
 
 # ============================================================ autostart
+def startup_dir() -> Path:
+    return Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
 def startup_file() -> Path:
-    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
-            / "Programs" / "Startup" / "ScreenRelay.bat")
+    return startup_dir() / "Screen Relay.lnk"
+
+
+def autostart_enabled() -> bool:
+    return startup_file().exists() or (startup_dir() / "ScreenRelay.bat").exists()
 
 
 def set_autostart(on: bool) -> None:
-    f = startup_file()
+    """Shortcut in the Startup folder (no console window flashing at logon)."""
+    (startup_dir() / "ScreenRelay.bat").unlink(missing_ok=True)      # old versions used a .bat
+    lnk = startup_file()
     if not on:
-        f.unlink(missing_ok=True)
+        lnk.unlink(missing_ok=True)
         return
     if getattr(sys, "frozen", False):
-        cmd = f'start "" "{sys.executable}" --autostart'
+        target, args = Path(sys.executable), "--autostart"
     else:
         pyw = Path(sys.executable).with_name("pythonw.exe")
-        exe = pyw if pyw.exists() else Path(sys.executable)
-        cmd = f'start "" "{exe}" "{Path(__file__).resolve()}" --autostart'
-    f.write_text("@echo off\r\n" + cmd + "\r\n", encoding="utf-8")
+        target = pyw if pyw.exists() else Path(sys.executable)
+        args = f'"{Path(__file__).resolve()}" --autostart'
+    q = ps_quote
+    run_powershell(
+        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut({q(lnk)}); "
+        f"$s.TargetPath = {q(target)}; $s.Arguments = {q(args)}; "
+        f"$s.WorkingDirectory = {q(target.parent)}; $s.Description = {q(APP_NAME)}; $s.Save()",
+        wait=True)
+    if not lnk.exists():
+        raise RuntimeError("ярлык не создался")
 
 
 # ============================================================ GUI
@@ -662,12 +704,19 @@ class App:
         ttk.Label(conn, text="Адрес:").grid(row=0, column=0, sticky="w", padx=6, pady=3)
         self.server_var = tk.StringVar(value=self.cfg["server"])
         self.server_entry = ttk.Entry(conn, textvariable=self.server_var)
-        self.server_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+        self.server_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(conn, text="🌐 Смотреть", command=self.open_viewer).grid(row=0, column=2, padx=6, sticky="ew")
         ttk.Label(conn, text="Токен:").grid(row=1, column=0, sticky="w", padx=6, pady=3)
         self.token_var = tk.StringVar(value=self.cfg["token"])
         self.token_entry = ttk.Entry(conn, textvariable=self.token_var, show="•")
         self.token_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(conn, text="👁", width=3, command=self.toggle_token).grid(row=1, column=2, padx=6)
+        ttk.Button(conn, text="👁 Показать", command=self.toggle_token).grid(row=1, column=2, padx=6, sticky="ew")
+        hint = ttk.Frame(conn)
+        hint.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 4))
+        self.code_label = ttk.Label(hint, foreground="#666",
+                                    text="Есть код подключения sr1:… от setup.sh? Вставь его в поле «Адрес» или нажми →")
+        self.code_label.pack(side="left")
+        ttk.Button(hint, text="📋 Вставить код", command=self.paste_code).pack(side="right")
         conn.columnconfigure(1, weight=1)
 
         src = ttk.LabelFrame(self.root, text="Что транслировать")
@@ -715,7 +764,7 @@ class App:
         wb.pack(side="left", padx=4)
         wb.bind("<<ComboboxSelected>>", lambda e: self.on_option())
         self.fps_var.trace_add("write", lambda *a: self.on_option())
-        self.server_var.trace_add("write", lambda *a: self.on_option())
+        self.server_var.trace_add("write", lambda *a: self.on_server_typed())
         self.token_var.trace_add("write", lambda *a: self.on_option())
 
         bottom = ttk.Frame(self.root)
@@ -736,7 +785,7 @@ class App:
         if not pystray:
             cb.state(["disabled"])
         if IS_WIN:
-            self.boot_var = tk.BooleanVar(value=startup_file().exists())
+            self.boot_var = tk.BooleanVar(value=autostart_enabled())
             ttk.Checkbutton(bottom, text="Запускать вместе с Windows",
                             variable=self.boot_var, command=self.on_boot).pack(anchor="w")
 
@@ -775,6 +824,43 @@ class App:
                         minimize_to_tray=bool(self.tray_var.get()),
                         server=self.server_var.get().strip(), token=self.token_var.get().strip())
         self.push_cfg()
+
+    def apply_code(self, text) -> bool:
+        res = decode_code(text)
+        if not res:
+            return False
+        server, token = res
+        self.server_var.set(server)
+        self.token_var.set(token)
+        self.code_label.config(text="Код подключения применён ✓ Адрес и токен заполнены.", foreground="#27ae60")
+        self.on_option()
+        return True
+
+    def on_server_typed(self):
+        val = self.server_var.get()
+        if val.strip().startswith("sr1:"):
+            self.root.after(1, lambda: self.apply_code(val))
+        else:
+            self.on_option()
+
+    def paste_code(self):
+        if self.net:
+            self.code_label.config(text="Сначала останови трансляцию", foreground="#e67e22")
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not self.apply_code(text):
+            self.code_label.config(text="В буфере обмена нет кода sr1:… - скопируй его из вывода setup.sh",
+                                   foreground="#e74c3c")
+
+    def open_viewer(self):
+        base = server_http_base(self.server_var.get())
+        if not base:
+            self.code_label.config(text="Сначала укажи адрес сервера", foreground="#e74c3c")
+            return
+        webbrowser.open(base + "/")
 
     def on_boot(self):
         try:
@@ -1161,7 +1247,15 @@ def selftest() -> int:
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         img.save(io.BytesIO(), "JPEG")
         make_icon()
-        log.write_text(f"OK windows={len(titles)} tray={pystray.Icon.__module__}\n", encoding="utf-8")
+        assert decode_code("sr1:eyJzIjoid3NzOi8veC95IiwidCI6ImFiYyJ9") == ("wss://x/y", "abc"), "connection code"
+        extra = ""
+        if IS_WIN:
+            set_autostart(True)
+            assert startup_file().exists(), "autostart shortcut not created"
+            set_autostart(False)
+            assert not startup_file().exists(), "autostart shortcut not removed"
+            extra = " autostart=ok"
+        log.write_text(f"OK windows={len(titles)} tray={pystray.Icon.__module__}{extra}\n", encoding="utf-8")
         return 0
     except Exception as e:
         import traceback

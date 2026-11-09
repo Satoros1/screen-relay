@@ -1,7 +1,8 @@
 services:
   relay:
     build: ./server
+    container_name: screen-relay
     env_file: .env
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8090:8000"   # наружу только через Caddy
+      - "127.0.0.1:${RELAY_PORT:-8090}:8000"   # наружу только через Caddy
