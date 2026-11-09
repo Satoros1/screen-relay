@@ -1,0 +1,81 @@
+name: Build ScreenRelay.exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r desktop/requirements.txt pyinstaller
+
+      - name: Build exe
+        working-directory: desktop
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name ScreenRelay
+          --icon assets/icon.ico --hidden-import pystray._win32 ScreenRelay.pyw
+
+      - name: Self-test the exe
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\ScreenRelay.exe -ArgumentList "--selftest" -PassThru -Wait
+          Get-Content dist\selftest.log
+          if ($p.ExitCode -ne 0) { throw "self-test failed" }
+
+      - name: Test self-update (replace exe + restart)
+        working-directory: desktop
+        shell: pwsh
+        timeout-minutes: 4
+        run: |
+          Start-Process -FilePath dist\ScreenRelay.exe -ArgumentList "--selftest-swap"
+          for ($i = 0; $i -lt 90 -and -not (Test-Path dist\swap-ok.txt); $i++) { Start-Sleep -Seconds 1 }
+          $ok = Test-Path dist\swap-ok.txt
+          if (-not $ok) {
+            Write-Host "--- swap-error.txt"; Get-Content dist\swap-error.txt -ErrorAction SilentlyContinue
+            Write-Host "--- update log";     Get-Content "$env:TEMP\ScreenRelay-update.log" -ErrorAction SilentlyContinue
+            Write-Host "--- processes";      Get-Process ScreenRelay, powershell -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, MainWindowTitle
+            Get-ChildItem dist
+            throw "updated exe did not start"
+          }
+          Start-Sleep -Seconds 2
+          Get-Content "$env:TEMP\ScreenRelay-update.log"
+          if (Test-Path dist\ScreenRelay.update.exe) { throw "update file was not moved into place" }
+          Remove-Item dist\swap-ok.txt, dist\selftest.log -ErrorAction SilentlyContinue
+          Write-Host "self-update works"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRelay
+          path: desktop/dist/ScreenRelay.exe
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path desktop/ScreenRelay.pyw -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      # Release named after APP_VERSION. Bump the version in the code -> new release;
+      # same version -> the exe in the existing release is replaced.
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Screen Relay ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: desktop/dist/ScreenRelay.exe
+          make_latest: true

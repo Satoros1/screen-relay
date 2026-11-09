@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+desktop/build/
+desktop/dist/
+desktop/*.spec
+desktop/selftest.log
+docker-compose.override.yml
