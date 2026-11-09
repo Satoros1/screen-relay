@@ -104,8 +104,9 @@ add_block() {   # add_block <Caddyfile> <upstream>
 }
 CADDY_DONE=""
 SUGGEST_UPSTREAM="$UPSTREAM_HOST"
-CADDY_CT=$($DOCKER ps --format '{{.Names}} {{.Image}}' | awk '$2 ~ /caddy/ {print $1; exit}')
-if command -v caddy >/dev/null && [ -f /etc/caddy/Caddyfile ] && systemctl is-active --quiet caddy 2>/dev/null; then
+CADDY_CT=$($DOCKER ps --format '{{.Names}} {{.Image}} {{.Ports}}' | awk '$2 ~ /caddy/ && /:443->/ {print $1; exit}')
+[ -z "$CADDY_CT" ] && CADDY_CT=$($DOCKER ps --format '{{.Names}} {{.Image}}' | awk '$2 ~ /caddy/ {print $1; exit}')
+if [ -z "$CADDY_CT" ] && command -v caddy >/dev/null && [ -f /etc/caddy/Caddyfile ] && systemctl is-active --quiet caddy 2>/dev/null; then
   if add_block /etc/caddy/Caddyfile "$UPSTREAM_HOST"; then
     if $SUDO caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
       $SUDO systemctl reload caddy && c_ok "Caddy перезагружен"
@@ -134,11 +135,18 @@ EOF
   [ -z "$SRC" ] && SRC=$($DOCKER inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/caddy"}}{{.Source}}/Caddyfile{{end}}{{end}}' "$CADDY_CT")
   if [ -n "$SRC" ] && $SUDO test -f "$SRC"; then
     if add_block "$SRC" "screen-relay:8000"; then
-      if $DOCKER exec "$CADDY_CT" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+      # never leave Caddy with a config it can't load - it serves the other sites too
+      if ! $DOCKER exec "$CADDY_CT" grep -q "$DOMAIN" /etc/caddy/Caddyfile; then
+        $SUDO cp "$SRC.bak.screen-relay" "$SRC"
+        c_err "Контейнер $CADDY_CT не видит изменений в $SRC. Вернул как было."
+        c_warn "Добавь блок вручную и перезапусти: docker restart $CADDY_CT"; exit 1
+      fi
+      if $DOCKER exec "$CADDY_CT" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+         && $DOCKER exec "$CADDY_CT" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
         c_ok "Caddy перезагружен"
       else
         $SUDO cp "$SRC.bak.screen-relay" "$SRC"
-        c_err "Caddy не принял конфиг, вернул как было"; exit 1
+        c_err "Caddy не принял конфиг (ошибка в $SRC?), вернул как было. Проверь: cat -n $SRC"; exit 1
       fi
     fi
     CADDY_DONE=1

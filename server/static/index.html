@@ -64,6 +64,7 @@
   let memKey = '';
 
   let ws = null, backoff = 500, frames = 0, lastFrameAt = 0, decoding = false, pending = null;
+  let lastMsgAt = 0, serverLive = false;
 
   function setState(text, color) { $('state').textContent = text; $('dot').style.background = color; }
 
@@ -109,18 +110,25 @@
 
     ws.onopen = () => ws.send(JSON.stringify(auth));
     ws.onmessage = ev => {
-      if (typeof ev.data !== 'string') { draw(ev.data); return; }
+      if (typeof ev.data !== 'string') { lastMsgAt = performance.now(); draw(ev.data); return; }
+      lastMsgAt = performance.now();
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       if (m.type === 'auth') {
         if (!m.ok) {
           authed = false;
           if (m.reason === 'full') { setState('Слишком много зрителей', 'var(--bad)'); return; }
-          if (inTelegram) { setState('Нет доступа', 'var(--bad)'); return; }
+          if (inTelegram) {
+            setState('Нет доступа', 'var(--bad)');
+            $('stale').textContent = 'Нет доступа. Закрой окно и нажми Start в боте: владельцу придёт запрос.';
+            $('stale').style.display = 'flex';
+            return;
+          }
           store.clear(); showLogin('Неверный ключ'); return;
         }
         authed = true; backoff = 500; setState('Ожидание кадров…', 'var(--warn)');
       } else if (m.type === 'status') {
         const live = m.online && m.age !== null && m.age < 5;
+        serverLive = live;
         setState(live ? 'LIVE' : (m.online ? 'ПК подключён, нет кадров' : 'ПК не в сети'),
                  live ? 'var(--ok)' : 'var(--bad)');
         $('stale').style.display = live ? 'none' : 'flex';
@@ -134,6 +142,15 @@
       backoff = Math.min(backoff * 2, 10000);
     };
   }
+
+  // watchdog: the connection looks open but nothing arrives (sleeping phone, stuck proxy) -> reconnect
+  setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    const silent = lastMsgAt && now - lastMsgAt > 8000;                 // server sends status every 2 s
+    const frozen = serverLive && lastFrameAt && now - lastFrameAt > 10000;
+    if (silent || frozen) { try { ws.close(); } catch (e) {} }
+  }, 2000);
 
   setInterval(() => {
     $('fps').textContent = frames ? `${frames} fps` : '';

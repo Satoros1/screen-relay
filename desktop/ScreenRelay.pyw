@@ -39,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -480,6 +480,8 @@ class Capture(threading.Thread):
         self.jpeg = None
         self.jpeg_seq = 0
         self.out_size = (0, 0)
+        self.scale = 1.0              # auto quality: 1.0 = as set, lower on a slow connection
+        self.heartbeat = time.monotonic()
         self.status = "Запуск…"
         self.src = WindowSource()
 
@@ -492,6 +494,7 @@ class Capture(threading.Thread):
         last_digest, last_sent, last_preview = None, 0.0, 0.0
         while not self.stop_ev.is_set():
             t0 = time.monotonic()
+            self.heartbeat = t0
             cfg = self.cfg
             try:
                 img, self.status = self.src.grab(cfg.get("window_title", ""), sct)
@@ -515,13 +518,17 @@ class Capture(threading.Thread):
                         if box[2] - box[0] >= 8 and box[3] - box[1] >= 8:
                             out = img.crop(box)
                     mw = cfg.get("max_width", "")
-                    if str(mw).isdigit() and out.width > int(mw):
-                        mw = int(mw)
+                    limit = int(mw) if str(mw).isdigit() else out.width
+                    if self.scale < 0.8:
+                        limit = max(480, int(limit * (self.scale + 0.2)))
+                    if out.width > limit:
+                        mw = limit
                         out = out.resize((mw, max(1, round(out.height * mw / out.width))), Image.LANCZOS)
                     digest = hashlib.blake2b(out.tobytes(), digest_size=16).digest()
                     if digest != last_digest or t0 - last_sent >= 2:
                         buf = io.BytesIO()
-                        out.save(buf, "JPEG", quality=int(cfg.get("quality", 70)))
+                        q = int(cfg.get("quality", 70))
+                        out.save(buf, "JPEG", quality=max(25, int(q * self.scale)))
                         with self.lock:
                             self.jpeg = buf.getvalue()
                             self.jpeg_seq += 1
@@ -542,6 +549,8 @@ class Net(threading.Thread):
         self.viewers = None
         self.frames = 0
         self.bytes = 0
+        self.send_avg = 0.0           # smoothed seconds per frame upload
+        self.last_sent = time.monotonic()
 
     def stop(self):
         self.stop_ev.set()
@@ -585,7 +594,10 @@ class Net(threading.Thread):
                             raise ConnectionError("соединение закрыто")
                         seq, data = self.cap.get_jpeg()
                         if data and seq != last_seq:
-                            await ws.send(data)
+                            ts = time.monotonic()
+                            await asyncio.wait_for(ws.send(data), 20)
+                            self.send_avg = self.send_avg * 0.8 + (time.monotonic() - ts) * 0.2
+                            self.last_sent = time.monotonic()
                             self.frames += 1
                             self.bytes += len(data)
                             last_seq = seq
@@ -1148,6 +1160,32 @@ class App:
     def set_state(self, text, color):
         self.state_label.config(text=f"● {text}", fg=color)
 
+    def health_check(self):
+        """Self-healing: restart a dead capture thread, reconnect a stuck upload, adapt quality."""
+        now = time.monotonic()
+        if not self.cap.is_alive() or now - self.cap.heartbeat > 15:
+            streaming = self.cap.streaming
+            self.cap.stop_ev.set()
+            self.cap = Capture(self.cfg)
+            self.cap.streaming = streaming
+            self.cap.start()
+            if self.net:
+                self.net.cap = self.cap
+            self.set_state("Захват завис - перезапустил", "#e67e22")
+            return
+        net = self.net
+        if not net or net.state != "live":
+            return
+        seq, _ = self.cap.get_jpeg()
+        if now - net.last_sent > 25 and seq and self.cap.preview is not None and self.cap.src.missing_since is None:
+            self.reconnect("Отправка застряла - переподключаюсь")
+            return
+        budget = 1.0 / max(1, int(self.cfg.get("fps", 8)))
+        if net.send_avg > budget * 1.2 and self.cap.scale > 0.4:
+            self.cap.scale = round(max(0.4, self.cap.scale - 0.1), 2)
+        elif net.send_avg < budget * 0.4 and self.cap.scale < 1.0:
+            self.cap.scale = round(min(1.0, self.cap.scale + 0.05), 2)
+
     def tick_status(self):
         try:
             wall = time.time()
@@ -1155,6 +1193,7 @@ class App:
                 self.reconnect("ПК проснулся - переподключаюсь")
             self.last_wall = wall
             self.maybe_launch_emulator()
+            self.health_check()
             net = self.net
             src_status = self.cap.status
             if net:
@@ -1175,7 +1214,8 @@ class App:
                     self.set_state(net.message, "#e67e22")
                     self.update_tray("retry", f"{APP_NAME}: {net.message}")
                 w, h = self.cap.out_size
-                self.info_label.config(text=f"{src_status}" + (f" · кадр {w}×{h}" if w else ""))
+                auto = f" · авто-качество {int(self.cap.scale * 100)}% (медленный интернет)" if self.cap.scale < 0.99 else ""
+                self.info_label.config(text=f"{src_status}" + (f" · кадр {w}×{h}" if w else "") + auto)
             else:
                 self.info_label.config(text=src_status)
         finally:

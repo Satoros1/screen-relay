@@ -6,3 +6,4 @@ desktop/dist/
 desktop/*.spec
 desktop/selftest.log
 docker-compose.override.yml
+data/

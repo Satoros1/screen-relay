@@ -19,6 +19,8 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 import httpx
+
+import bot as tgbot
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -49,8 +51,9 @@ TG_API = os.environ.get("TG_API", "https://api.telegram.org")
 
 if len(PUSH_TOKEN) < 16:
     raise SystemExit("PUSH_TOKEN не задан или короче 16 символов")
-if not VIEW_KEY and not (BOT_TOKEN and ALLOWED_IDS):
+if not VIEW_KEY and not (BOT_TOKEN and tgbot.ADMINS):
     raise SystemExit("Нужен VIEW_KEY и/или BOT_TOKEN + ALLOWED_IDS, иначе никто не сможет смотреть")
+SEND_TIMEOUT = 15          # a viewer that can't take a frame for this long is dropped (frozen tab, dead network)
 
 STATIC = Path(__file__).parent / "static"
 
@@ -101,7 +104,7 @@ ALERT_TEXT = {
 
 
 async def watchdog():
-    """Message ALLOWED_IDS when the stream goes down / comes back (after ALERT_AFTER seconds)."""
+    """Message admins when the stream goes down / comes back (after ALERT_AFTER seconds)."""
     reported = None              # nothing is reported until the stream has been live once
     candidate, since = None, time.time()
     while True:
@@ -116,11 +119,29 @@ async def watchdog():
         if candidate != reported and time.time() - since >= ALERT_AFTER:
             reported = candidate
             log.info("состояние трансляции: %s", candidate)
-            for uid in ALLOWED_IDS:
+            for uid in tgbot.ADMINS:
                 payload = {"chat_id": uid, "text": ALERT_TEXT[candidate]}
                 if candidate == "live" and watch_button():
                     payload["reply_markup"] = watch_button()
                 await tg("sendMessage", payload)
+
+
+def status_text() -> str:
+    st = stream_state()
+    head = {"live": "🟢 В эфире", "no_frames": "🟠 ПК на связи, кадров нет", "offline": "🔴 ПК не в сети"}[st]
+    age = f", последний кадр {round(time.time() - hub.frame_ts)} с назад" if hub.frame_ts else ""
+    return f"{head}{age}\nСмотрят сейчас: {hub.viewers}\nЗрителей с доступом: {len(tgbot.store.users)}"
+
+
+VIEWER_SOCKETS: dict[int, set] = {}
+
+
+async def kick_viewer(uid: int):
+    for ws in list(VIEWER_SOCKETS.get(uid, ())):
+        try:
+            await ws.close(code=4403)
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -128,8 +149,10 @@ async def lifespan(_app):
     tasks = []
     if BOT_TOKEN:
         tasks.append(asyncio.create_task(setup_menu_button()))
-        if ALERTS and ALLOWED_IDS:
+        if ALERTS and tgbot.ADMINS:
             tasks.append(asyncio.create_task(watchdog()))
+        b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer)
+        tasks.append(asyncio.create_task(b.run()))
     yield
     for t in tasks:
         t.cancel()
@@ -315,6 +338,8 @@ async def ingest(ws: WebSocket):
                 break
             data = msg.get("bytes")
             if data:
+                if data[:2] != b"\xff\xd8":
+                    continue                     # not a JPEG - ignore garbage
                 if len(data) > MAX_FRAME_BYTES:
                     log.warning("кадр слишком большой (%d байт), пропускаю", len(data))
                     continue
@@ -337,11 +362,13 @@ async def view(ws: WebSocket):
         await ws.close(code=4400)
         return
 
-    who = None
+    who, uid = None, None
     if hello.get("initData"):
         uid = check_init_data(str(hello["initData"]))
-        if uid is not None and uid in ALLOWED_IDS:
+        if uid is not None and tgbot.store.allowed(uid):
             who = f"tg:{uid}"
+        else:
+            uid = None
     elif hello.get("key") and same(str(hello["key"]), VIEW_KEY):
         who = "key"
 
@@ -355,6 +382,8 @@ async def view(ws: WebSocket):
         return
 
     await ws.send_text(json.dumps({"type": "auth", "ok": True}))
+    if uid is not None:
+        VIEWER_SOCKETS.setdefault(uid, set()).add(ws)
     hub.viewers += 1
     log.info("зритель %s подключился (всего %d)", who, hub.viewers)
     last_seq = -1
@@ -363,14 +392,22 @@ async def view(ws: WebSocket):
         while True:
             seq, frame = await hub.next_frame(last_seq, STATUS_EVERY)
             if seq != last_seq and frame is not None:
-                await ws.send_bytes(frame)
+                await asyncio.wait_for(ws.send_bytes(frame), SEND_TIMEOUT)
             last_seq = seq
             now = time.monotonic()
             if now - last_status >= STATUS_EVERY:
-                await ws.send_text(json.dumps(hub.status()))
+                await asyncio.wait_for(ws.send_text(json.dumps(hub.status())), SEND_TIMEOUT)
                 last_status = now
-    except (WebSocketDisconnect, RuntimeError):
+    except asyncio.TimeoutError:
+        log.info("зритель %s не принимает кадры - отключаю", who)
+        try:
+            await ws.close(code=1011)
+        except Exception:
+            pass
+    except (WebSocketDisconnect, RuntimeError, OSError):
         pass
     finally:
+        if uid is not None:
+            VIEWER_SOCKETS.get(uid, set()).discard(ws)
         hub.viewers -= 1
         log.info("зритель %s отключился (всего %d)", who, hub.viewers)
