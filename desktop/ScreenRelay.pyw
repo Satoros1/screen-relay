@@ -188,12 +188,15 @@ try {{ Start-Process -FilePath $old -ArgumentList {arglist} -ErrorAction Stop; "
 catch {{ "restart failed: $_" | Out-File -LiteralPath $log -Append -Encoding utf8 }}
 """
     encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    # the new exe must start as an independent app, not as a child of this PyInstaller bootloader
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("_PYI_", "_MEIPASS"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     subprocess.Popen(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
          "-EncodedCommand", encoded],
         creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        close_fds=True,
+        close_fds=True, env=env,
     )
 
 
