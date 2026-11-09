@@ -110,11 +110,13 @@ def display_name(u: dict) -> str:
 class Bot:
     """Long-polling bot. `hooks` gives access to the relay: status text, kicking viewers."""
 
-    def __init__(self, token: str, api: str, public_url: str, status_text, kick):
+    def __init__(self, token: str, api: str, public_url: str, status_text, kick, get_frame=None):
         self.base = f"{api}/bot{token}"
         self.public_url = public_url
         self.status_text = status_text
         self.kick = kick
+        self.get_frame = get_frame        # () -> (jpeg bytes | None, unix time of the frame)
+        self.shot_at: dict[int, float] = {}
         self.username = ""
         self.client = httpx.AsyncClient(timeout=70)
 
@@ -130,16 +132,17 @@ class Bot:
             return None
 
     def watch_kb(self):
-        if not self.public_url.startswith("https://"):
-            return None
-        return {"inline_keyboard": [[{"text": "📺 Смотреть", "web_app": {"url": self.public_url + "/"}}]]}
+        row = [{"text": "📸 Снимок", "callback_data": "shot"}]
+        if self.public_url.startswith("https://"):
+            row.insert(0, {"text": "📺 Смотреть", "web_app": {"url": self.public_url + "/"}})
+        return {"inline_keyboard": [row]}
 
     def admin_kb(self):
         return {"inline_keyboard": [
             [{"text": "➕ Пригласить", "callback_data": "invite"},
              {"text": "👥 Зрители", "callback_data": "users"}],
             [{"text": "📊 Статус", "callback_data": "status"}],
-        ] + (self.watch_kb() or {"inline_keyboard": []})["inline_keyboard"]}
+        ] + self.watch_kb()["inline_keyboard"]}
 
     async def send(self, chat_id: int, text: str, kb=None):
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
@@ -162,6 +165,11 @@ class Bot:
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0].lower()
 
+        if cmd == "/shot":
+            if store.allowed(uid):
+                return await self.send_shot(chat, uid)
+            return await self.send(chat, "Нет доступа. Нажми /start, чтобы запросить.")
+
         if uid in ADMINS:
             if cmd == "/invite":
                 return await self.send_invite(chat)
@@ -178,7 +186,8 @@ class Bot:
                 "➕ <b>Пригласить</b>: одноразовая ссылка на 24 ч, отправь её человеку.\n"
                 "👥 <b>Зрители</b>: список, удалить в один клик.\n"
                 "Если кто-то сам нажмёт Start, тебе придёт запрос с кнопками.\n\n"
-                "Команды: /invite /users /status /add &lt;id&gt;",
+                "📸 <b>Снимок</b> (/shot): текущий кадр картинкой.\n\n"
+                "Команды: /shot /invite /users /status /add &lt;id&gt;",
                 self.admin_kb())
 
         if cmd == "/start" and arg.startswith("inv_"):
@@ -190,7 +199,8 @@ class Bot:
             return await self.send(chat, "Ссылка уже использована или устарела. Попроси новую.")
 
         if store.allowed(uid):
-            return await self.send(chat, "Трансляция тут 👇 (или кнопка «📺 Live» слева от поля ввода)",
+            return await self.send(chat, "Трансляция тут 👇 (или кнопка «📺 Live» слева от поля ввода).\n"
+                                         "📸 /shot - прислать текущий кадр картинкой.",
                                    self.watch_kb())
 
         # unknown user -> request to admins
@@ -210,6 +220,8 @@ class Bot:
         msg = q.get("message") or {}
         chat = (msg.get("chat") or {}).get("id")
         await self.call("answerCallbackQuery", callback_query_id=q["id"])
+        if data == "shot" and chat and uid and store.allowed(uid):
+            return await self.send_shot(chat, uid)
         if uid not in ADMINS or not chat:
             return
         action, _, arg = data.partition(":")
@@ -247,6 +259,28 @@ class Bot:
         await self.call("editMessageText", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
                         text=text, parse_mode="HTML")
 
+    async def send_shot(self, chat: int, uid: int):
+        now = time.time()
+        if now - self.shot_at.get(uid, 0) < 3:          # no spamming
+            return
+        self.shot_at[uid] = now
+        frame, ts = self.get_frame() if self.get_frame else (None, 0)
+        if not frame:
+            return await self.send(chat, "🔴 Кадров пока нет: ПК не в сети или трансляция не запущена.")
+        age = int(now - ts)
+        when = time.strftime("%H:%M:%S", time.localtime(ts))
+        caption = f"📸 {when}" + (f"  ⚠️ кадр старый ({age // 60} мин) - ПК не в сети?" if age > 60 else "")
+        try:
+            r = await self.client.post(
+                f"{self.base}/sendPhoto",
+                data={"chat_id": str(chat), "caption": caption,
+                      "reply_markup": json.dumps(self.watch_kb())},
+                files={"photo": ("shot.jpg", frame, "image/jpeg")})
+            if not r.json().get("ok"):
+                log.warning("sendPhoto: %s", r.json().get("description"))
+        except Exception as e:
+            log.warning("sendPhoto недоступен: %s", e)
+
     async def send_invite(self, chat: int):
         if not self.username:
             return await self.send(chat, "Не знаю имя бота, проверь BOT_TOKEN")
@@ -276,6 +310,7 @@ class Bot:
         await self.call("deleteWebhook")
         await self.call("setMyCommands", commands=[
             {"command": "start", "description": "Открыть трансляцию"},
+            {"command": "shot", "description": "Снимок: текущий кадр"},
             {"command": "invite", "description": "Пригласить (админ)"},
             {"command": "users", "description": "Зрители (админ)"},
             {"command": "status", "description": "Статус трансляции"},

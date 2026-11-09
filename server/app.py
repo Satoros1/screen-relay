@@ -151,7 +151,8 @@ async def lifespan(_app):
         tasks.append(asyncio.create_task(setup_menu_button()))
         if ALERTS and tgbot.ADMINS:
             tasks.append(asyncio.create_task(watchdog()))
-        b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer)
+        b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer,
+                      lambda: (hub.frame, hub.frame_ts))
         tasks.append(asyncio.create_task(b.run()))
     yield
     for t in tasks:
