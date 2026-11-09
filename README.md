@@ -46,7 +46,7 @@ Python не нужен. Windows может предупредить «неизв
 ## Новая версия exe
 
 GitHub собирает exe сам при каждом пуше в `main` (Actions → последний запуск → Artifacts).
-Чтобы выпустить релиз: `git tag v0.1.1 && git push --tags`. Версию поменяй и в `APP_VERSION` в `desktop/ScreenRelay.pyw`.
+Релиз создаётся сам из `APP_VERSION` в `desktop/ScreenRelay.pyw`: подними версию (0.1.0 → 0.1.1), запушь в `main`, и в Releases появится новый exe.
 Собрать локально: `desktop/build_exe.bat`.
 
 ### Что нужно на этом ПК
