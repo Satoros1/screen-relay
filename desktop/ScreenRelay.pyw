@@ -39,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -59,6 +59,7 @@ DEFAULTS = {
     "emulator_shortcut": "",     # BlueStacks app shortcut (.lnk) to (re)start the emulator with the app
     "auto_launch": True,         # start it by itself when the window is missing
     "keep_awake": True,          # don't let the PC sleep / turn the screen off while streaming
+    "hide_on_minimize": True,    # minimizing the emulator hides it off-screen instead (keeps streaming)
 }
 
 
@@ -286,6 +287,11 @@ if IS_WIN:
     _sig(user32.IsWindow, W.BOOL, W.HWND)
     _sig(user32.IsIconic, W.BOOL, W.HWND)
     _sig(user32.ShowWindow, W.BOOL, W.HWND, ctypes.c_int)
+    _sig(user32.GetWindowRect, W.BOOL, W.HWND, ctypes.POINTER(W.RECT))
+    _sig(user32.SetWindowPos, W.BOOL, W.HWND, W.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, W.UINT)
+    _sig(user32.GetForegroundWindow, W.HWND)
+    _sig(user32.GetSystemMetrics, ctypes.c_int, ctypes.c_int)
+    _sig(user32.SetForegroundWindow, W.BOOL, W.HWND)
     _sig(user32.GetClientRect, W.BOOL, W.HWND, ctypes.POINTER(W.RECT))
     _sig(user32.ClientToScreen, W.BOOL, W.HWND, ctypes.POINTER(W.POINT))
     _sig(user32.GetDC, W.HDC, W.HWND)
@@ -317,6 +323,25 @@ if IS_WIN:
         except Exception:
             return False
         return val.value != 0
+
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x1, 0x4, 0x10
+
+    def window_rect(hwnd):
+        r = W.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return r.left, r.top, r.right, r.bottom
+
+    def virtual_screen():
+        x, y = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)     # SM_X/YVIRTUALSCREEN
+        return x, y, x + user32.GetSystemMetrics(78), y + user32.GetSystemMetrics(79)
+
+    def is_offscreen(hwnd) -> bool:
+        l, t, r, b = window_rect(hwnd)
+        vl, vt, vr, vb = virtual_screen()
+        return l >= vr or r <= vl or t >= vb or b <= vt
+
+    def move_window(hwnd, x, y):
+        user32.SetWindowPos(hwnd, None, int(x), int(y), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
 
     def client_size(hwnd):
         r = W.RECT()
@@ -417,6 +442,10 @@ class WindowSource:
         self.retry_print_at = 0.0
         self.last_find = 0.0
         self.missing_since = None     # monotonic time since the window can't be found
+        self.hide_on_minimize = True
+        self.hidden = False           # window parked off-screen by us
+        self.home = None              # (x, y) where to put it back
+        self.request = None           # "hide" / "show" from the GUI thread
 
     def grab(self, title: str, sct) -> tuple[Image.Image | None, str]:
         if not title:
@@ -440,9 +469,9 @@ class WindowSource:
                 return None, f"Окно «{title}» не найдено - жду…"
             self.missing_since = None
 
-        if user32.IsIconic(self.hwnd):
-            user32.ShowWindow(self.hwnd, 4)    # SW_SHOWNOACTIVATE - unminimize without stealing focus
-            return None, "Окно было свёрнуто - разворачиваю"
+        msg = self._hide_logic()
+        if msg:
+            return None, msg
 
         w, h = client_size(self.hwnd)
         if w < 10 or h < 10:
@@ -456,16 +485,57 @@ class WindowSource:
             img = print_window(self.hwnd, w, h)
             if img is not None and not is_black(img):
                 self.black_count = 0
-                return img, "Захват: окно (можно перекрывать другими окнами)"
+                return img, ("Захват: окно спрятано за краем экрана (клик по нему на панели задач - показать)"
+                             if self.hidden else "Захват: окно (можно перекрывать и сворачивать)")
             self.black_count += 1
             if self.black_count < 3:
                 return None, "Пробую захватить окно…"
             self.mode = "screen"
             self.retry_print_at = now + 30
 
+        if self.hidden:
+            self.request = "show"
+            return None, "Этот эмулятор не отдаёт картинку, когда спрятан - показываю окно обратно"
         shot = sct.grab(screen_rect(self.hwnd))
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         return img, "Захват: с экрана - не перекрывай окно эмулятора"
+
+
+def _wsrc_hide_logic(self) -> str | None:
+    """Minimized windows are not rendered by Windows, so 'minimize' = park the window off-screen."""
+    hwnd = self.hwnd
+    if not self.hidden and is_offscreen(hwnd):        # left there by a previous run / update restart
+        self.hidden = True
+    req, self.request = self.request, None
+    fg = user32.GetForegroundWindow() == hwnd
+    activated, self.was_fg = fg and not getattr(self, "was_fg", False), fg   # it just got focus (taskbar click)
+    if req == "show" or (self.hidden and activated and req != "hide"):
+        if self.hidden:                                # user clicked it on the taskbar -> bring it back
+            vl, vt, vr, vb = virtual_screen()
+            x, y = self.home or (vl + 80, vt + 60)
+            move_window(hwnd, x, y)
+            self.hidden = False
+            if req == "show":
+                user32.SetForegroundWindow(hwnd)
+        return None
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 4)                     # SW_SHOWNOACTIVATE
+        if self.hide_on_minimize:
+            req = "hide"
+        else:
+            return "Окно было свёрнуто - разворачиваю"
+    if req == "hide" and not self.hidden:
+        l, t, r, b = window_rect(hwnd)
+        if l > -30000:                                 # -32000 = Windows' "minimized" position
+            self.home = (l, t)
+        vl, vt, vr, vb = virtual_screen()
+        move_window(hwnd, vr + 200, t if vt <= t < vb else vt)
+        self.hidden = True
+        self.mode, self.black_count = "print", 0
+    return None
+
+
+WindowSource._hide_logic = _wsrc_hide_logic
 
 
 class Capture(threading.Thread):
@@ -821,6 +891,9 @@ class App:
         self.win_box.bind("<<ComboboxSelected>>", self.on_window_selected)
         self.win_box.bind("<Button-1>", lambda e: self.refresh_windows())
         ttk.Button(top, text="⟳ Обновить", command=self.refresh_windows).pack(side="left")
+        if IS_WIN:
+            self.hide_btn = ttk.Button(top, text="🙈 Спрятать окно", command=self.toggle_hide)
+            self.hide_btn.pack(side="left", padx=(4, 0))
 
         self.canvas = tk.Canvas(src, bg="#15171c", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True, padx=6, pady=4)
@@ -901,6 +974,9 @@ class App:
         cb.pack(anchor="w")
         if not pystray:
             cb.state(["disabled"])
+        self.hidemin_var = tk.BooleanVar(value=self.cfg["hide_on_minimize"])
+        ttk.Checkbutton(bottom, text="Свернул BlueStacks - прятать за край экрана (трансляция идёт дальше)",
+                        variable=self.hidemin_var, command=self.on_option).pack(anchor="w")
         self.awake_var = tk.BooleanVar(value=self.cfg["keep_awake"])
         ttk.Checkbutton(bottom, text="Не давать ПК засыпать и гасить экран во время трансляции",
                         variable=self.awake_var, command=self.on_awake).pack(anchor="w")
@@ -937,6 +1013,7 @@ class App:
 
     def push_cfg(self):
         self.cap.cfg = dict(self.cfg)
+        self.cap.src.hide_on_minimize = bool(self.cfg.get("hide_on_minimize", True))
         if self.save_job:
             self.root.after_cancel(self.save_job)
         self.save_job = self.root.after(500, lambda: save_settings(self.cfg))
@@ -953,6 +1030,7 @@ class App:
                         minimize_to_tray=bool(self.tray_var.get()),
                         auto_launch=bool(self.launch_var.get()),
                         keep_awake=bool(self.awake_var.get()),
+                        hide_on_minimize=bool(self.hidemin_var.get()),
                         server=self.server_var.get().strip(), token=self.token_var.get().strip())
         self.push_cfg()
 
@@ -1166,7 +1244,9 @@ class App:
         if not self.cap.is_alive() or now - self.cap.heartbeat > 15:
             streaming = self.cap.streaming
             self.cap.stop_ev.set()
+            old_src = self.cap.src
             self.cap = Capture(self.cfg)
+            self.cap.src = old_src
             self.cap.streaming = streaming
             self.cap.start()
             if self.net:
@@ -1194,6 +1274,7 @@ class App:
             self.last_wall = wall
             self.maybe_launch_emulator()
             self.health_check()
+            self.update_hide_btn()
             net = self.net
             src_status = self.cap.status
             if net:
@@ -1330,6 +1411,8 @@ class App:
                 pystray.MenuItem(lambda it: "Остановить трансляцию" if self.net else "Начать трансляцию",
                                  lambda i, it: post(self.toggle)),
                 pystray.MenuItem("🔄 Восстановить", lambda i, it: post(self.restore)),
+                pystray.MenuItem(lambda it: "👁 Показать BlueStacks" if self.cap.src.hidden else "🙈 Спрятать BlueStacks",
+                                 lambda i, it: post(self.toggle_hide)),
                 pystray.MenuItem(lambda it: f"Обновить до {self.updater.latest['version']}"
                                  if self.updater.latest else "Проверить обновления",
                                  lambda i, it: post(self.check_updates)),
@@ -1463,9 +1546,33 @@ class App:
             self.upd_btn.config(state="normal")
             self.upd_label.config(text=f"Не удалось перезапустить: {e}", foreground="#e74c3c")
             return
-        self.quit()
+        self.quit(show_emulator=False)
 
-    def quit(self):
+    def toggle_hide(self):
+        src = self.cap.src
+        if not src.hwnd:
+            self.set_state("Окно не найдено", "#e74c3c")
+            return
+        src.request = "show" if src.hidden else "hide"
+        self.root.after(400, self.update_hide_btn)
+
+    def update_hide_btn(self):
+        if hasattr(self, "hide_btn"):
+            self.hide_btn.config(text="👁 Показать окно" if self.cap.src.hidden else "🙈 Спрятать окно")
+        if self.tray:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def quit(self, show_emulator: bool = True):
+        if show_emulator and IS_WIN and self.cap.src.hidden and self.cap.src.hwnd:
+            try:                     # never leave the emulator lost off-screen
+                vl, vt, _, _ = virtual_screen()
+                x, y = self.cap.src.home or (vl + 80, vt + 60)
+                move_window(self.cap.src.hwnd, x, y)
+            except Exception:
+                pass
         self.on_option()
         save_settings(self.cfg)
         if self.net:
@@ -1537,6 +1644,32 @@ def selftest() -> int:
             set_keep_awake(True)
             set_keep_awake(False)
             extra = " autostart=ok shortcuts=ok"
+            # parked off-screen window must still be capturable
+            t = tk.Tk()
+            t.title("SR hide test")
+            t.geometry("300x200+100+100")
+            tk.Frame(t, bg="#ff0000", width=300, height=200).pack(fill="both", expand=True)
+            for _ in range(20):
+                t.update()
+                time.sleep(0.05)
+            hw = find_window("SR hide test")
+            src = WindowSource()
+            src.hwnd, src.title = hw, "SR hide test"
+            src.request = "hide"
+            src._hide_logic()
+            for _ in range(10):
+                t.update()
+                time.sleep(0.05)
+            off = is_offscreen(hw)
+            w, h = client_size(hw)
+            img = print_window(hw, w, h)
+            red = img is not None and img.resize((1, 1)).getpixel((0, 0))[0] > 150
+            src.request = "show"
+            src._hide_logic()
+            back = not is_offscreen(hw)
+            t.destroy()
+            assert off and back, f"hide/show failed off={off} back={back}"
+            extra += f" hide=ok offscreen_capture={'ok' if red else 'BLACK'}"
         log.write_text(f"OK windows={len(titles)} tray={pystray.Icon.__module__}{extra}\n", encoding="utf-8")
         return 0
     except Exception as e:
