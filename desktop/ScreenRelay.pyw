@@ -13,12 +13,17 @@ import hashlib
 import io
 import json
 import os
+import base64
 import queue
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tkinter import ttk
 
@@ -33,7 +38,9 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
+GITHUB_REPO = "Satoros1/screen-relay"
+EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
 IS_WIN = sys.platform == "win32"
 SCREEN = "🖥  Весь экран"
@@ -62,6 +69,128 @@ def make_icon(dot="#888888", size=64) -> Image.Image:
     d.rounded_rectangle((s * .24, s * .84, s * .76, s * .94), radius=s * .04, fill="#dfe3ea")
     d.ellipse((s * .34, s * .27, s * .66, s * .59), fill=dot)
     return img
+
+
+# ============================================================ updates
+def parse_ver(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3]) or (0,)
+
+
+def http_get(url: str, headers: dict | None = None, timeout: float = 15):
+    req = urllib.request.Request(url, headers={"User-Agent": f"ScreenRelay/{APP_VERSION}", **(headers or {})})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def server_http_base(ws_url: str) -> str | None:
+    """wss://live.example.com/ingest -> https://live.example.com"""
+    m = re.match(r"^(wss?)://([^/]+)", ws_url.strip())
+    if not m:
+        return None
+    return ("https" if m.group(1) == "wss" else "http") + "://" + m.group(2)
+
+
+class Updater:
+    """Checks GitHub Releases (or the relay server, if the repo is private) for a newer exe."""
+
+    def __init__(self, post):
+        self.post = post            # puts a callable into the GUI queue
+        self.busy = False
+        self.latest = None          # {"version", "url", "headers", "size"} if newer than ours
+
+    def check(self, server: str, token: str, on_done):
+        if self.busy:
+            return
+        self.busy = True
+
+        def work():
+            result, error = None, None
+            try:
+                result = self._find_latest(server, token)
+            except Exception as e:
+                error = str(e) or type(e).__name__
+            self.busy = False
+            if result and parse_ver(result["version"]) > parse_ver(APP_VERSION):
+                self.latest = result
+            elif result:
+                self.latest = None
+            self.post(lambda: on_done(self.latest, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _find_latest(self, server: str, token: str) -> dict:
+        try:   # 1) public GitHub release
+            with http_get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                          {"Accept": "application/vnd.github+json"}) as r:
+                rel = json.load(r)
+            asset = next(a for a in rel.get("assets", []) if a["name"].lower() == EXE_NAME.lower())
+            return {"version": rel["tag_name"].lstrip("v"), "url": asset["browser_download_url"],
+                    "headers": {}, "size": asset["size"]}
+        except urllib.error.HTTPError as e:
+            if e.code not in (403, 404):
+                raise
+        except StopIteration:
+            raise RuntimeError("в релизе нет ScreenRelay.exe")
+        # 2) private repo -> ask our relay server, it has a GitHub token
+        base = server_http_base(server)
+        if not base or not token:
+            raise RuntimeError("репозиторий приватный - нужен адрес сервера и токен")
+        auth = {"Authorization": f"Bearer {token}"}
+        try:
+            with http_get(f"{base}/update/latest", auth) as r:
+                info = json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise RuntimeError("репозиторий приватный, а на сервере не задан GH_TOKEN")
+            raise
+        return {"version": info["version"], "url": f"{base}/update/download",
+                "headers": auth, "size": info["size"]}
+
+    def download(self, on_progress, on_done):
+        info = self.latest
+        target = Path(sys.executable).with_name("ScreenRelay.update.exe")
+
+        def work():
+            try:
+                got = 0
+                with http_get(info["url"], info["headers"], timeout=60) as r, open(target, "wb") as f:
+                    while chunk := r.read(256 * 1024):
+                        f.write(chunk)
+                        got += len(chunk)
+                        pct = int(got * 100 / info["size"]) if info["size"] else 0
+                        self.post(lambda p=pct: on_progress(p))
+                with open(target, "rb") as f:
+                    if f.read(2) != b"MZ" or (info["size"] and got != info["size"]):
+                        raise RuntimeError("скачанный файл повреждён")
+                self.post(lambda: on_done(target, None))
+            except Exception as e:
+                target.unlink(missing_ok=True)
+                msg = str(e) or type(e).__name__
+                self.post(lambda: on_done(None, msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+def launch_swap_and_restart(new_exe: Path, args: list[str]) -> None:
+    """Hidden PowerShell waits until we exit, replaces the exe and starts the new one."""
+    def q(x):
+        return "'" + str(x).replace("'", "''") + "'"
+    old = Path(sys.executable)
+    arglist = ",".join(q(a) for a in args) if args else "@()"
+    script = f"""
+$old = {q(old)}; $new = {q(new_exe)}
+for ($i = 0; $i -lt 120; $i++) {{
+  try {{ Move-Item -LiteralPath $new -Destination $old -Force -ErrorAction Stop; break }}
+  catch {{ Start-Sleep -Milliseconds 500 }}
+}}
+Start-Process -FilePath $old -ArgumentList {arglist}
+"""
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+         "-EncodedCommand", encoded],
+        creationflags=0x08000000 | 0x00000200,   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        close_fds=True,
+    )
 
 
 # ============================================================ settings
@@ -481,6 +610,8 @@ class App:
         self.tray = None
         self.tray_state = None
         self.hint_shown = False
+        self.updater = Updater(self.ui_q.put)
+        self.can_update = IS_WIN and getattr(sys, "frozen", False)
 
         root.title(f"{APP_NAME} {APP_VERSION}")
         self.win_icon = ImageTk.PhotoImage(make_icon("#27ae60"))
@@ -503,6 +634,11 @@ class App:
                 root.withdraw()
             else:
                 root.after(500, root.iconify)
+        if "--updated" in sys.argv:
+            self.upd_label.config(text=f"Обновлено до {APP_VERSION} ✓", foreground="#27ae60")
+            self.notify(f"Обновлено до версии {APP_VERSION}")
+        if self.can_update:
+            root.after(5000, self.auto_check)
 
     # ---------------------------------------------------- layout
     def _build(self):
@@ -577,6 +713,12 @@ class App:
 
         bottom = ttk.Frame(self.root)
         bottom.pack(fill="x", **pad)
+        upd = ttk.Frame(bottom)
+        upd.pack(side="right", anchor="ne")
+        self.upd_btn = ttk.Button(upd, text="⟳ Проверить обновления", command=self.check_updates)
+        self.upd_btn.pack(anchor="e")
+        self.upd_label = ttk.Label(upd, text=f"Версия {APP_VERSION}", foreground="#666")
+        self.upd_label.pack(anchor="e", pady=(2, 0))
         self.auto_var = tk.BooleanVar(value=self.cfg["start_on_launch"])
         ttk.Checkbutton(bottom, text="Начинать трансляцию сразу при запуске",
                         variable=self.auto_var, command=self.on_option).pack(anchor="w")
@@ -830,6 +972,9 @@ class App:
                 pystray.MenuItem("Открыть", lambda i, it: post(self.show_window), default=True),
                 pystray.MenuItem(lambda it: "Остановить трансляцию" if self.net else "Начать трансляцию",
                                  lambda i, it: post(self.toggle)),
+                pystray.MenuItem(lambda it: f"Обновить до {self.updater.latest['version']}"
+                                 if self.updater.latest else "Проверить обновления",
+                                 lambda i, it: post(self.check_updates)),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Выход", lambda i, it: post(self.quit)),
             )
@@ -890,6 +1035,78 @@ class App:
         else:
             self.quit()
 
+    # ---------------------------------------------------- updates
+    def notify(self, text):
+        try:
+            if self.tray and getattr(self.tray, "HAS_NOTIFICATION", False):
+                self.tray.notify(text, APP_NAME)
+        except Exception:
+            pass
+
+    def auto_check(self):
+        self.updater.check(self.cfg["server"], self.cfg["token"], self.on_checked_silent)
+        self.root.after(6 * 3600 * 1000, self.auto_check)
+
+    def on_checked_silent(self, latest, error):
+        if latest:
+            self.show_update_available(latest)
+            if self.root.state() == "withdrawn":
+                self.notify(f"Доступна версия {latest['version']} - нажми «Обновить» в меню значка")
+
+    def show_update_available(self, latest):
+        self.upd_btn.config(text=f"⬇ Обновить до {latest['version']}", state="normal")
+        self.upd_label.config(text=f"Сейчас {APP_VERSION}", foreground="#e67e22")
+        if self.tray:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
+
+    def check_updates(self):
+        if self.updater.latest:
+            self.install_update()
+            return
+        if not self.can_update:
+            self.upd_label.config(text="Обновление работает только в exe", foreground="#e67e22")
+            return
+        self.on_option()
+        self.upd_btn.config(state="disabled")
+        self.upd_label.config(text="Проверяю…", foreground="#666")
+        self.updater.check(self.cfg["server"], self.cfg["token"], self.on_checked_manual)
+
+    def on_checked_manual(self, latest, error):
+        self.upd_btn.config(state="normal")
+        if error:
+            self.upd_label.config(text=f"Не удалось: {error[:70]}", foreground="#e74c3c")
+        elif latest:
+            self.show_update_available(latest)
+        else:
+            self.upd_label.config(text=f"У тебя последняя версия ({APP_VERSION}) ✓", foreground="#27ae60")
+
+    def install_update(self):
+        self.upd_btn.config(state="disabled")
+        self.upd_label.config(text="Скачиваю… 0%", foreground="#666")
+        self.updater.download(
+            lambda p: self.upd_label.config(text=f"Скачиваю… {p}%"),
+            self.on_downloaded)
+
+    def on_downloaded(self, path, error):
+        if error:
+            self.upd_btn.config(state="normal")
+            self.upd_label.config(text=f"Ошибка загрузки: {error[:60]}", foreground="#e74c3c")
+            return
+        self.upd_label.config(text="Перезапускаю…")
+        args = ["--updated"]
+        if self.net:                       # keep streaming after the restart
+            args.append("--autostart")
+        try:
+            launch_swap_and_restart(path, args)
+        except Exception as e:
+            self.upd_btn.config(state="normal")
+            self.upd_label.config(text=f"Не удалось перезапустить: {e}", foreground="#e74c3c")
+            return
+        self.quit()
+
     def quit(self):
         self.on_option()
         save_settings(self.cfg)
@@ -901,9 +1118,16 @@ class App:
                 self.tray.stop()
             except Exception:
                 pass
+        if getattr(self, "instance_sock", None):
+            try:
+                self.instance_sock.close()
+            except OSError:
+                pass
         self.root.destroy()
 
     def listen_instances(self, srv: socket.socket):
+        self.instance_sock = srv
+
         def loop():
             while True:
                 try:
@@ -941,6 +1165,15 @@ def selftest() -> int:
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--selftest-swap" in sys.argv:          # CI: exercise the real update/restart path
+        import shutil
+        new = Path(sys.executable).with_name("ScreenRelay.update.exe")
+        shutil.copyfile(sys.executable, new)
+        launch_swap_and_restart(new, ["--selftest-marker"])
+        return
+    if "--selftest-marker" in sys.argv:
+        Path(sys.executable).with_name("swap-ok.txt").write_text(APP_VERSION, encoding="utf-8")
+        return
     autostart = "--autostart" in sys.argv
     # one copy only: if it's already running (e.g. hidden in the tray), just show it
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -17,11 +17,13 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+import httpx
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 log = logging.getLogger("relay")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)   # do not log signed download URLs
 
 PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "")
 VIEW_KEY = os.environ.get("VIEW_KEY", "")
@@ -33,6 +35,10 @@ MAX_FRAME_BYTES = int(os.environ.get("MAX_FRAME_BYTES", 3_000_000))
 MAX_VIEWERS = int(os.environ.get("MAX_VIEWERS", 20))
 INITDATA_TTL = int(os.environ.get("INITDATA_TTL", 86400))
 STATUS_EVERY = 2.0
+# Updates for the desktop app when the GitHub repo is private (token with read access to it)
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+UPDATE_REPO = os.environ.get("UPDATE_REPO", "Satoros1/screen-relay")
+EXE_NAME = "ScreenRelay.exe"
 
 if len(PUSH_TOKEN) < 16:
     raise SystemExit("PUSH_TOKEN не задан или короче 16 символов")
@@ -114,6 +120,78 @@ async def index():
 @app.get("/health")
 async def health():
     return JSONResponse(hub.status())
+
+
+# ------------------------------------------------------------ desktop app updates
+_release_cache: dict = {"at": 0.0, "data": None}
+
+
+def _push_auth(request: Request) -> bool:
+    h = request.headers.get("authorization", "")
+    return h.startswith("Bearer ") and same(h[7:], PUSH_TOKEN)
+
+
+async def _latest_release() -> dict | None:
+    if time.time() - _release_cache["at"] < 300 and _release_cache["data"]:
+        return _release_cache["data"]
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                        headers={"Authorization": f"Bearer {GH_TOKEN}",
+                                 "Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        rel = r.json()
+    asset = next((a for a in rel.get("assets", []) if a["name"].lower() == EXE_NAME.lower()), None)
+    if not asset:
+        return None
+    data = {"version": rel["tag_name"].lstrip("v"), "size": asset["size"], "asset_url": asset["url"]}
+    _release_cache.update(at=time.time(), data=data)
+    return data
+
+
+@app.get("/update/latest")
+async def update_latest(request: Request):
+    if not _push_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not GH_TOKEN:
+        return JSONResponse({"error": "GH_TOKEN not set"}, status_code=404)
+    try:
+        rel = await _latest_release()
+    except httpx.HTTPError as e:
+        log.warning("GitHub недоступен: %s", e)
+        return JSONResponse({"error": "github unavailable"}, status_code=502)
+    if not rel:
+        return JSONResponse({"error": "no exe in latest release"}, status_code=404)
+    return {"version": rel["version"], "size": rel["size"]}
+
+
+@app.get("/update/download")
+async def update_download(request: Request):
+    if not _push_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not GH_TOKEN:
+        return JSONResponse({"error": "GH_TOKEN not set"}, status_code=404)
+    rel = await _latest_release()
+    if not rel:
+        return JSONResponse({"error": "no exe in latest release"}, status_code=404)
+    client = httpx.AsyncClient(timeout=60, follow_redirects=True)
+    req = client.build_request("GET", rel["asset_url"], headers={
+        "Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/octet-stream"})
+    resp = await client.send(req, stream=True)
+    if resp.status_code != 200:
+        await resp.aclose()
+        await client.aclose()
+        return JSONResponse({"error": f"github {resp.status_code}"}, status_code=502)
+
+    async def body():
+        try:
+            async for chunk in resp.aiter_bytes(256 * 1024):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(body(), media_type="application/octet-stream",
+                             headers={"Content-Length": str(rel["size"])})
 
 
 @app.websocket("/ingest")

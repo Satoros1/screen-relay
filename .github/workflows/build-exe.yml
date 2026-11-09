@@ -35,6 +35,18 @@ jobs:
           Get-Content dist\selftest.log
           if ($p.ExitCode -ne 0) { throw "self-test failed" }
 
+      - name: Test self-update (replace exe + restart)
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          Start-Process -FilePath dist\ScreenRelay.exe -ArgumentList "--selftest-swap" -Wait
+          for ($i = 0; $i -lt 60 -and -not (Test-Path dist\swap-ok.txt); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path dist\swap-ok.txt)) { throw "updated exe did not start" }
+          Start-Sleep -Seconds 2
+          if (Test-Path dist\ScreenRelay.update.exe) { throw "update file was not moved into place" }
+          Remove-Item dist\swap-ok.txt, dist\selftest.log -ErrorAction SilentlyContinue
+          Write-Host "self-update works"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ScreenRelay
