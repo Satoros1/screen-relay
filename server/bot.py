@@ -43,6 +43,7 @@ class Store:
     def __init__(self):
         self.users: dict[str, dict] = {}       # "id" -> {"name", "added"}
         self.invites: dict[str, float] = {}    # code -> expires_at
+        self.guests: dict[str, float] = {}     # browser guest token -> access ends at
         self.requests: dict[str, float] = {}   # "id" -> last request time (not saved)
         self.load()
 
@@ -52,6 +53,7 @@ class Store:
             self.users = {str(k): v for k, v in data.get("users", {}).items()}
             now = time.time()
             self.invites = {k: v for k, v in data.get("invites", {}).items() if v > now}
+            self.guests = {k: v for k, v in data.get("guests", {}).items() if v > now}
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -61,7 +63,7 @@ class Store:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STORE.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"users": self.users, "invites": self.invites},
+            tmp.write_text(json.dumps({"users": self.users, "invites": self.invites, "guests": self.guests},
                                       ensure_ascii=False, indent=1), encoding="utf-8")
             tmp.replace(STORE)
         except Exception as e:
@@ -89,6 +91,24 @@ class Store:
         self.save()
         return code
 
+    def new_guest(self, minutes: int) -> tuple[str, float]:
+        now = time.time()
+        self.guests = {k: v for k, v in self.guests.items() if v > now}
+        token = secrets.token_urlsafe(12)
+        self.guests[token] = now + minutes * 60
+        self.save()
+        return token, self.guests[token]
+
+    def guest_until(self, token: str) -> float | None:
+        exp = self.guests.get(token)
+        return exp if exp and exp > time.time() else None
+
+    def close_guests(self) -> int:
+        n = len(self.guests)
+        self.guests = {}
+        self.save()
+        return n
+
     def use_invite(self, code: str) -> bool:
         exp = self.invites.pop(code, None)
         if exp is None:
@@ -110,15 +130,21 @@ def display_name(u: dict) -> str:
 class Bot:
     """Long-polling bot. `hooks` gives access to the relay: status text, kicking viewers."""
 
-    def __init__(self, token: str, api: str, public_url: str, status_text, kick, get_frame=None):
+    def __init__(self, token: str, api: str, public_url: str, status_text, kick, get_frame=None,
+                 kick_guests=None):
         self.base = f"{api}/bot{token}"
         self.public_url = public_url
         self.status_text = status_text
         self.kick = kick
         self.get_frame = get_frame        # () -> (jpeg bytes | None, unix time of the frame)
         self.shot_at: dict[int, float] = {}
+        self._kick_guests = kick_guests
         self.username = ""
         self.client = httpx.AsyncClient(timeout=70)
+
+    async def kick_guests(self):
+        if self._kick_guests:
+            await self._kick_guests()
 
     async def call(self, method: str, **payload):
         try:
@@ -141,6 +167,8 @@ class Bot:
         return {"inline_keyboard": [
             [{"text": "➕ Пригласить", "callback_data": "invite"},
              {"text": "👥 Зрители", "callback_data": "users"}],
+            [{"text": "⏱ Гость на 15 мин", "callback_data": "guest:15"},
+             {"text": "⏱ на 1 час", "callback_data": "guest:60"}],
             [{"text": "📊 Статус", "callback_data": "status"}],
         ] + self.watch_kb()["inline_keyboard"]}
 
@@ -177,6 +205,9 @@ class Bot:
                 return await self.send_users(chat)
             if cmd == "/status":
                 return await self.send(chat, self.status_text())
+            if cmd == "/guest":
+                mins = int(arg) if arg.strip().isdigit() and 1 <= int(arg) <= 1440 else 15
+                return await self.send_guest(chat, mins)
             if cmd == "/add" and arg.strip().isdigit():
                 store.add(int(arg), f"id {arg.strip()}")
                 return await self.send(chat, f"✅ Добавил <code>{arg.strip()}</code>")
@@ -186,8 +217,10 @@ class Bot:
                 "➕ <b>Пригласить</b>: одноразовая ссылка на 24 ч, отправь её человеку.\n"
                 "👥 <b>Зрители</b>: список, удалить в один клик.\n"
                 "Если кто-то сам нажмёт Start, тебе придёт запрос с кнопками.\n\n"
+                "⏱ <b>Гость</b>: ссылка для браузера на 15 мин / 1 час, без Telegram и ключа. "
+                "Скинул другу, он посмотрел, потом доступ сам пропадает (/guest 30 - на 30 мин).\n"
                 "📸 <b>Снимок</b> (/shot): текущий кадр картинкой.\n\n"
-                "Команды: /shot /invite /users /status /add &lt;id&gt;",
+                "Команды: /guest /shot /invite /users /status /add &lt;id&gt;",
                 self.admin_kb())
 
         if cmd == "/start" and arg.startswith("inv_"):
@@ -231,6 +264,12 @@ class Bot:
             return await self.send_users(chat)
         if action == "status":
             return await self.send(chat, self.status_text())
+        if action == "guest" and arg.isdigit():
+            return await self.send_guest(chat, int(arg))
+        if action == "guestclose":
+            n = store.close_guests()
+            await self.kick_guests()
+            return await self.send(chat, f"🔒 Гостевые ссылки закрыты ({n}), гости отключены.")
         if not arg.lstrip("-").isdigit():
             return
         target = int(arg)
@@ -281,6 +320,19 @@ class Bot:
         except Exception as e:
             log.warning("sendPhoto недоступен: %s", e)
 
+    async def send_guest(self, chat: int, minutes: int):
+        if not self.public_url.startswith("https://"):
+            return await self.send(chat, "Не задан PUBLIC_URL в .env")
+        token, until = store.new_guest(minutes)
+        link = f"{self.public_url}/?g={token}"
+        end = time.strftime("%H:%M", time.localtime(until))
+        await self.send(chat,
+                        f"⏱ Гостевая ссылка на <b>{minutes} мин</b> (до {end}). "
+                        f"Откроется в любом браузере, Telegram не нужен:\n\n{link}\n\n"
+                        "Потом доступ пропадёт сам, открытая страница закроется.",
+                        {"inline_keyboard": [[{"text": "🔒 Закрыть всех гостей сейчас",
+                                               "callback_data": "guestclose"}]]})
+
     async def send_invite(self, chat: int):
         if not self.username:
             return await self.send(chat, "Не знаю имя бота, проверь BOT_TOKEN")
@@ -311,6 +363,7 @@ class Bot:
         await self.call("setMyCommands", commands=[
             {"command": "start", "description": "Открыть трансляцию"},
             {"command": "shot", "description": "Снимок: текущий кадр"},
+            {"command": "guest", "description": "Гостевая ссылка на 15 мин (админ)"},
             {"command": "invite", "description": "Пригласить (админ)"},
             {"command": "users", "description": "Зрители (админ)"},
             {"command": "status", "description": "Статус трансляции"},

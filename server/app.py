@@ -134,6 +134,16 @@ def status_text() -> str:
 
 
 VIEWER_SOCKETS: dict[int, set] = {}
+GUEST_SOCKETS: set = set()
+
+
+async def kick_guests():
+    for ws in list(GUEST_SOCKETS):
+        try:
+            await ws.send_text(json.dumps({"type": "auth", "ok": False, "reason": "expired"}))
+            await ws.close(code=4410)
+        except Exception:
+            pass
 
 
 async def kick_viewer(uid: int):
@@ -152,7 +162,7 @@ async def lifespan(_app):
         if ALERTS and tgbot.ADMINS:
             tasks.append(asyncio.create_task(watchdog()))
         b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer,
-                      lambda: (hub.frame, hub.frame_ts))
+                      lambda: (hub.frame, hub.frame_ts), kick_guests)
         tasks.append(asyncio.create_task(b.run()))
     yield
     for t in tasks:
@@ -363,8 +373,16 @@ async def view(ws: WebSocket):
         await ws.close(code=4400)
         return
 
-    who, uid = None, None
-    if hello.get("initData"):
+    who, uid, guest_until = None, None, None
+    if hello.get("guest"):
+        guest_until = tgbot.store.guest_until(str(hello["guest"]))
+        if guest_until:
+            who = "guest"
+        else:
+            await ws.send_text(json.dumps({"type": "auth", "ok": False, "reason": "expired"}))
+            await ws.close(code=4410)
+            return
+    elif hello.get("initData"):
         uid = check_init_data(str(hello["initData"]))
         if uid is not None and tgbot.store.allowed(uid):
             who = f"tg:{uid}"
@@ -382,7 +400,9 @@ async def view(ws: WebSocket):
         await ws.close(code=4429)
         return
 
-    await ws.send_text(json.dumps({"type": "auth", "ok": True}))
+    await ws.send_text(json.dumps({"type": "auth", "ok": True, "until": guest_until}))
+    if guest_until:
+        GUEST_SOCKETS.add(ws)
     if uid is not None:
         VIEWER_SOCKETS.setdefault(uid, set()).add(ws)
     hub.viewers += 1
@@ -395,6 +415,10 @@ async def view(ws: WebSocket):
             if seq != last_seq and frame is not None:
                 await asyncio.wait_for(ws.send_bytes(frame), SEND_TIMEOUT)
             last_seq = seq
+            if guest_until and (time.time() >= guest_until or not tgbot.store.guest_until(str(hello["guest"]))):
+                await ws.send_text(json.dumps({"type": "auth", "ok": False, "reason": "expired"}))
+                await ws.close(code=4410)
+                break
             now = time.monotonic()
             if now - last_status >= STATUS_EVERY:
                 await asyncio.wait_for(ws.send_text(json.dumps(hub.status())), SEND_TIMEOUT)
@@ -408,6 +432,7 @@ async def view(ws: WebSocket):
     except (WebSocketDisconnect, RuntimeError, OSError):
         pass
     finally:
+        GUEST_SOCKETS.discard(ws)
         if uid is not None:
             VIEWER_SOCKETS.get(uid, set()).discard(ws)
         hub.viewers -= 1

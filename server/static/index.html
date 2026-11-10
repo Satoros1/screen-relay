@@ -64,7 +64,8 @@
   let memKey = '';
 
   let ws = null, backoff = 500, frames = 0, lastFrameAt = 0, decoding = false, pending = null;
-  let lastMsgAt = 0, serverLive = false;
+  let lastMsgAt = 0, serverLive = false, guestUntil = null, ended = false;
+  const guest = new URLSearchParams(location.search).get('g');
 
   function setState(text, color) { $('state').textContent = text; $('dot').style.background = color; }
 
@@ -96,8 +97,10 @@
   });
 
   function connect() {
+    if (ended) return;
     let auth;
-    if (inTelegram) auth = { initData: tg.initData };
+    if (guest) auth = { guest };
+    else if (inTelegram) auth = { initData: tg.initData };
     else {
       const k = store.get();
       if (!k) { showLogin(); return; }
@@ -116,6 +119,15 @@
       if (m.type === 'auth') {
         if (!m.ok) {
           authed = false;
+          if (m.reason === 'expired') {
+            ended = true;
+            setState('Ссылка истекла', 'var(--bad)');
+            $('fps').textContent = '';
+            ctx.clearRect(0, 0, cv.width, cv.height);
+            $('stale').textContent = 'Время гостевого доступа вышло. Попроси новую ссылку.';
+            $('stale').style.display = 'flex';
+            return;
+          }
           if (m.reason === 'full') { setState('Слишком много зрителей', 'var(--bad)'); return; }
           if (inTelegram) {
             setState('Нет доступа', 'var(--bad)');
@@ -125,7 +137,7 @@
           }
           store.clear(); showLogin('Неверный ключ'); return;
         }
-        authed = true; backoff = 500; setState('Ожидание кадров…', 'var(--warn)');
+        authed = true; backoff = 500; guestUntil = m.until || null; setState('Ожидание кадров…', 'var(--warn)');
       } else if (m.type === 'status') {
         const live = m.online && m.age !== null && m.age < 5;
         serverLive = live;
@@ -136,7 +148,7 @@
     };
     ws.onclose = ev => {
       ws = null;
-      if (ev.code === 4403 || ev.code === 4429) return;   // handled above
+      if (ended || ev.code === 4403 || ev.code === 4429 || ev.code === 4410) return;   // handled above
       setState('Переподключение…', 'var(--warn)');
       setTimeout(connect, backoff);
       backoff = Math.min(backoff * 2, 10000);
@@ -153,7 +165,12 @@
   }, 2000);
 
   setInterval(() => {
-    $('fps').textContent = frames ? `${frames} fps` : '';
+    let left = '';
+    if (guestUntil && !ended) {
+      const s = Math.max(0, Math.round(guestUntil - Date.now() / 1000));
+      left = ` · гость, осталось ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    }
+    $('fps').textContent = (frames ? `${frames} fps` : '') + left;
     frames = 0;
   }, 1000);
 
