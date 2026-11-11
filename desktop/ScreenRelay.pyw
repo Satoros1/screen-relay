@@ -1816,15 +1816,24 @@ def selftest() -> int:
                     t.update()
                     time.sleep(0.05)
 
+            def remote_do(*args):
+                """Like in real life: the target window handles its messages while we click."""
+                box = []
+                th = threading.Thread(target=lambda: box.append(src.remote_input(*args)), daemon=True)
+                th.start()
+                while th.is_alive():
+                    t.update()
+                    time.sleep(0.01)
+                pump()
+                return box[0] if box else (False, "no result")
+
             pump(20)
             hw = find_window("SR hide test")
             src = WindowSource()
             src.hwnd, src.title = hw, "SR hide test"
-            r1 = src.remote_input("tap", 0.25, 0.5)
-            pump()
+            r1 = remote_do("tap", 0.25, 0.5)
             tap_ok = "tap" in hits
-            r2 = src.remote_input("esc")
-            pump()
+            r2 = remote_do("esc")
             esc_ok = "esc" in hits
             remote = f" tap={'ok' if tap_ok else 'FAIL ' + r1[1]} esc={'ok' if esc_ok else 'FAIL ' + r2[1]}"
             src.request = "hide"
@@ -1837,9 +1846,10 @@ def selftest() -> int:
             img = print_window(hw, w, h)
             red = img is not None and img.resize((1, 1)).getpixel((0, 0))[0] > 150
             del hits[:]
-            r3 = src.remote_input("tap", 0.25, 0.5)      # hidden: comes back, gets clicked, hides again
-            pump()
-            remote += f" tap_hidden={'ok' if 'tap' in hits and is_offscreen(hw) else 'FAIL ' + r3[1]}"
+            r3 = remote_do("tap", 0.25, 0.5)             # hidden: comes back, gets clicked, hides again
+            hid_click, hid_off = "tap" in hits, is_offscreen(hw)
+            remote += (" tap_hidden=ok" if hid_click and hid_off else
+                       f" tap_hidden=FAIL(click={hid_click} parked_again={hid_off} {r3[1]})")
             src.request = "show"
             src._hide_logic()
             back = not is_offscreen(hw)
