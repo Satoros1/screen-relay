@@ -162,7 +162,7 @@ async def lifespan(_app):
         if ALERTS and tgbot.ADMINS:
             tasks.append(asyncio.create_task(watchdog()))
         b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer,
-                      lambda: (hub.frame, hub.frame_ts), kick_guests)
+                      lambda: (hub.frame, hub.frame_ts), kick_guests, remote)
         tasks.append(asyncio.create_task(b.run()))
     yield
     for t in tasks:
@@ -233,6 +233,103 @@ class Hub:
 
 
 hub = Hub()
+
+
+def frac(v) -> float | None:
+    """A coordinate as a fraction of the window: a real number in 0..1, else None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0.0 <= f <= 1.0 else None
+
+
+class Remote:
+    """Admin channel to the desktop app: click / Esc commands and whole-window frames.
+
+    Whole-window frames never go to ordinary viewers - only to admins (control view, bot).
+    """
+
+    def __init__(self) -> None:
+        self.sender = None                 # async callable(dict) of the connected desktop app
+        self.caps: set[str] = set()
+        self.pending: dict[int, asyncio.Future] = {}
+        self.next_id = 0
+        self.last_cmd = 0.0
+        self.full: bytes | None = None
+        self.full_seq = 0
+        self.cond = asyncio.Condition()
+        self.controllers = 0
+
+    async def _send(self, obj: dict) -> bool:
+        if self.sender is None:
+            return False
+        try:
+            await self.sender(obj)
+            return True
+        except Exception:
+            return False
+
+    async def want_full(self, on: bool = True) -> None:
+        await self._send({"cmd": "control", "on": on})
+
+    async def command(self, cmd: dict, timeout: float = 12) -> dict:
+        if self.sender is None:
+            return {"ok": False, "msg": "ПК не в сети"}
+        if "control" not in self.caps:
+            return {"ok": False, "msg": "обнови программу на ПК до 0.1.6: «Проверить обновления»"}
+        now = time.monotonic()
+        if now - self.last_cmd < 0.7:
+            return {"ok": False, "msg": "слишком часто, подожди секунду"}
+        self.last_cmd = now
+        self.next_id += 1
+        cid = self.next_id
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[cid] = fut
+        try:
+            if not await self._send({**cmd, "id": cid}):
+                return {"ok": False, "msg": "ПК не в сети"}
+            res = await asyncio.wait_for(fut, timeout)
+            return {"ok": bool(res.get("ok")), "msg": str(res.get("msg", ""))[:200]}
+        except asyncio.TimeoutError:
+            return {"ok": False, "msg": "ПК не ответил"}
+        finally:
+            self.pending.pop(cid, None)
+
+    def on_result(self, m: dict) -> None:
+        fut = self.pending.get(m.get("id"))
+        if fut and not fut.done():
+            fut.set_result(m)
+
+    def drop(self) -> None:
+        self.sender, self.caps = None, set()
+        for fut in self.pending.values():
+            if not fut.done():
+                fut.set_result({"ok": False, "msg": "ПК отключился"})
+
+    async def publish_full(self, data: bytes) -> None:
+        async with self.cond:
+            self.full = data
+            self.full_seq += 1
+            self.cond.notify_all()
+
+    async def next_full(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:
+        async with self.cond:
+            try:
+                await asyncio.wait_for(self.cond.wait_for(lambda: self.full_seq != last_seq), timeout)
+            except asyncio.TimeoutError:
+                pass
+            return self.full_seq, self.full
+
+    async def fresh_full(self, timeout: float = 5) -> bytes | None:
+        """Ask the PC for the whole window as it is right now (None if it didn't come)."""
+        seq = self.full_seq
+        await self.want_full()
+        new_seq, frame = await self.next_full(seq, timeout)
+        return frame if new_seq != seq else None
+
+
+remote = Remote()
 
 
 @app.get("/")
@@ -334,12 +431,23 @@ async def ingest(ws: WebSocket):
     my_gen = hub.publisher_gen
     hub.publisher_online = True
     await ws.send_text(json.dumps({"ok": True}))
-    log.info("стример подключился: %s", ws.client)
+    log.info("стример подключился: %s (v%s)", ws.client, hello.get("v", "?"))
+    send_lock = asyncio.Lock()
+
+    async def pub_send(obj: dict):
+        async with send_lock:
+            await asyncio.wait_for(ws.send_text(json.dumps(obj)), SEND_TIMEOUT)
+
+    caps = hello.get("caps")
+    remote.caps = {str(c) for c in caps} if isinstance(caps, list) else set()
+    remote.sender = pub_send
+    if remote.controllers:
+        await remote.want_full()
 
     async def report():   # tell the desktop app how many people are watching
         while True:
             await asyncio.sleep(3)
-            await ws.send_text(json.dumps({"viewers": hub.viewers}))
+            await pub_send({"viewers": hub.viewers})
 
     reporter = asyncio.create_task(report())
     try:
@@ -347,8 +455,21 @@ async def ingest(ws: WebSocket):
             msg = await ws.receive()
             if msg["type"] == "websocket.disconnect":
                 break
+            text = msg.get("text")
+            if text:
+                try:
+                    m = json.loads(text)
+                    if isinstance(m, dict) and m.get("type") == "result":
+                        remote.on_result(m)
+                except ValueError:
+                    pass
+                continue
             data = msg.get("bytes")
             if data:
+                if data[:3] == b"F\xff\xd8":         # whole window, for admins only
+                    if len(data) <= MAX_FRAME_BYTES:
+                        await remote.publish_full(data[1:])
+                    continue
                 if data[:2] != b"\xff\xd8":
                     continue                     # not a JPEG - ignore garbage
                 if len(data) > MAX_FRAME_BYTES:
@@ -361,6 +482,7 @@ async def ingest(ws: WebSocket):
         reporter.cancel()
         if hub.publisher_gen == my_gen:
             hub.publisher_online = False
+            remote.drop()
         log.info("стример отключился")
 
 
@@ -400,7 +522,8 @@ async def view(ws: WebSocket):
         await ws.close(code=4429)
         return
 
-    await ws.send_text(json.dumps({"type": "auth", "ok": True, "until": guest_until}))
+    await ws.send_text(json.dumps({"type": "auth", "ok": True, "until": guest_until,
+                                   "admin": uid is not None and uid in tgbot.ADMINS}))
     if guest_until:
         GUEST_SOCKETS.add(ws)
     if uid is not None:
@@ -437,3 +560,80 @@ async def view(ws: WebSocket):
             VIEWER_SOCKETS.get(uid, set()).discard(ws)
         hub.viewers -= 1
         log.info("зритель %s отключился (всего %d)", who, hub.viewers)
+
+
+@app.websocket("/control")
+async def control(ws: WebSocket):
+    """Admin's control view: sees the whole window, a tap on the picture = a click on the PC."""
+    await ws.accept()
+    try:
+        hello = json.loads(await asyncio.wait_for(ws.receive_text(), 10))
+    except Exception:
+        await ws.close(code=4400)
+        return
+    uid = check_init_data(str(hello.get("initData", "")))
+    if uid is None or uid not in tgbot.ADMINS:
+        await ws.send_text(json.dumps({"type": "auth", "ok": False}))
+        await ws.close(code=4403)
+        return
+    lock = asyncio.Lock()
+
+    async def send(obj: dict):
+        async with lock:
+            await asyncio.wait_for(ws.send_text(json.dumps(obj, ensure_ascii=False)), SEND_TIMEOUT)
+
+    await send({"type": "auth", "ok": True, "taps": tgbot.store.taps})
+    remote.controllers += 1
+    log.info("админ %s открыл управление", uid)
+
+    async def frames():
+        last, asked = -1, 0.0
+        while True:
+            now = time.monotonic()
+            if now - asked >= 10:                    # keep the PC sending whole-window frames
+                await remote.want_full()
+                asked = now
+            seq, frame = await remote.next_full(last, 2.0)
+            if seq != last and frame is not None:
+                async with lock:
+                    await asyncio.wait_for(ws.send_bytes(frame), SEND_TIMEOUT)
+            last = seq
+            await send({"type": "status", "online": hub.publisher_online,
+                        "supported": "control" in remote.caps})
+
+    pump = asyncio.create_task(frames())
+    try:
+        while True:
+            m = json.loads(await ws.receive_text())
+            if not isinstance(m, dict):
+                continue
+            kind = m.get("type")
+            if kind == "tap":
+                x, y = frac(m.get("x")), frac(m.get("y"))
+                if x is None or y is None:
+                    continue
+                res = await remote.command({"cmd": "tap", "x": x, "y": y})
+                log.info("админ %s: нажатие %.3f,%.3f -> %s", uid, x, y, res["msg"])
+                await send({"type": "result", **res})
+            elif kind == "key":
+                res = await remote.command({"cmd": "key", "key": "esc"})
+                log.info("админ %s: Esc -> %s", uid, res["msg"])
+                await send({"type": "result", **res})
+            elif kind == "save":
+                x, y = frac(m.get("x")), frac(m.get("y"))
+                name = " ".join(str(m.get("name", "")).split())[:24]
+                if x is None or y is None or not name:
+                    continue
+                ok = tgbot.store.add_tap(name, x, y)
+                await send({"type": "taps", "taps": tgbot.store.taps, "saved": ok})
+            elif kind == "del":
+                tgbot.store.del_tap(m.get("i"))
+                await send({"type": "taps", "taps": tgbot.store.taps})
+    except (WebSocketDisconnect, RuntimeError, OSError, ValueError, asyncio.TimeoutError):
+        pass
+    finally:
+        pump.cancel()
+        remote.controllers -= 1
+        if remote.controllers <= 0:
+            await remote.want_full(False)
+        log.info("админ %s закрыл управление", uid)

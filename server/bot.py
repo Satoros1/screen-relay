@@ -26,6 +26,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 STORE = DATA_DIR / "users.json"
 INVITE_TTL = 24 * 3600
 REQUEST_COOLDOWN = 600
+MAX_TAPS = 12
 
 
 def _ids(raw: str) -> set[int]:
@@ -44,6 +45,7 @@ class Store:
         self.users: dict[str, dict] = {}       # "id" -> {"name", "added"}
         self.invites: dict[str, float] = {}    # code -> expires_at
         self.guests: dict[str, float] = {}     # browser guest token -> access ends at
+        self.taps: list[dict] = []             # saved click points: {"name", "x", "y"} (fractions of the window)
         self.requests: dict[str, float] = {}   # "id" -> last request time (not saved)
         self.load()
 
@@ -54,6 +56,7 @@ class Store:
             now = time.time()
             self.invites = {k: v for k, v in data.get("invites", {}).items() if v > now}
             self.guests = {k: v for k, v in data.get("guests", {}).items() if v > now}
+            self.taps = [t for t in data.get("taps", []) if isinstance(t, dict) and "name" in t][:MAX_TAPS]
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -63,7 +66,8 @@ class Store:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STORE.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"users": self.users, "invites": self.invites, "guests": self.guests},
+            tmp.write_text(json.dumps({"users": self.users, "invites": self.invites, "guests": self.guests,
+                                       "taps": self.taps},
                                       ensure_ascii=False, indent=1), encoding="utf-8")
             tmp.replace(STORE)
         except Exception as e:
@@ -90,6 +94,21 @@ class Store:
         self.invites[code] = now + INVITE_TTL
         self.save()
         return code
+
+    def add_tap(self, name: str, x: float, y: float) -> bool:
+        self.taps = [t for t in self.taps if t["name"] != name]       # same name = replace
+        if len(self.taps) >= MAX_TAPS:
+            return False
+        self.taps.append({"name": name, "x": round(x, 4), "y": round(y, 4)})
+        self.save()
+        return True
+
+    def del_tap(self, i) -> bool:
+        if isinstance(i, int) and 0 <= i < len(self.taps):
+            self.taps.pop(i)
+            self.save()
+            return True
+        return False
 
     def new_guest(self, minutes: int) -> tuple[str, float]:
         now = time.time()
@@ -131,7 +150,7 @@ class Bot:
     """Long-polling bot. `hooks` gives access to the relay: status text, kicking viewers."""
 
     def __init__(self, token: str, api: str, public_url: str, status_text, kick, get_frame=None,
-                 kick_guests=None):
+                 kick_guests=None, remote=None):
         self.base = f"{api}/bot{token}"
         self.public_url = public_url
         self.status_text = status_text
@@ -139,6 +158,7 @@ class Bot:
         self.get_frame = get_frame        # () -> (jpeg bytes | None, unix time of the frame)
         self.shot_at: dict[int, float] = {}
         self._kick_guests = kick_guests
+        self.remote = remote              # click / Esc on the PC, whole-window snapshots
         self.username = ""
         self.client = httpx.AsyncClient(timeout=70)
 
@@ -169,7 +189,8 @@ class Bot:
              {"text": "👥 Зрители", "callback_data": "users"}],
             [{"text": "⏱ Гость на 15 мин", "callback_data": "guest:15"},
              {"text": "⏱ на 1 час", "callback_data": "guest:60"}],
-            [{"text": "📊 Статус", "callback_data": "status"}],
+            [{"text": "🎮 Управление", "callback_data": "ctl"},
+             {"text": "📊 Статус", "callback_data": "status"}],
         ] + self.watch_kb()["inline_keyboard"]}
 
     async def send(self, chat_id: int, text: str, kb=None):
@@ -205,6 +226,15 @@ class Bot:
                 return await self.send_users(chat)
             if cmd == "/status":
                 return await self.send(chat, self.status_text())
+            if cmd == "/control":
+                return await self.send_control(chat)
+            if cmd == "/tap":
+                parts = arg.replace(",", " ").split()
+                if len(parts) == 2 and all(p.replace(".", "", 1).isdigit() for p in parts) \
+                        and all(0 <= float(p) <= 100 for p in parts):
+                    return await self.do_remote(chat, {"cmd": "tap", "x": float(parts[0]) / 100,
+                                                       "y": float(parts[1]) / 100})
+                return await self.send(chat, "Формат: <code>/tap 85 12</code> - 85% слева, 12% сверху окна.")
             if cmd == "/guest":
                 mins = int(arg) if arg.strip().isdigit() and 1 <= int(arg) <= 1440 else 15
                 return await self.send_guest(chat, mins)
@@ -219,8 +249,10 @@ class Bot:
                 "Если кто-то сам нажмёт Start, тебе придёт запрос с кнопками.\n\n"
                 "⏱ <b>Гость</b>: ссылка для браузера на 15 мин / 1 час, без Telegram и ключа. "
                 "Скинул другу, он посмотрел, потом доступ сам пропадает (/guest 30 - на 30 мин).\n"
-                "📸 <b>Снимок</b> (/shot): текущий кадр картинкой.\n\n"
-                "Команды: /guest /shot /invite /users /status /add &lt;id&gt;",
+                "📸 <b>Снимок</b> (/shot): текущий кадр картинкой.\n"
+                "🎮 <b>Управление</b> (/control): выскочило окно и закрыло статистику - нажми «Назад» "
+                "или свою сохранённую кнопку, я кликну на ПК и пришлю снимок.\n\n"
+                "Команды: /control /guest /shot /invite /users /status /add &lt;id&gt;",
                 self.admin_kb())
 
         if cmd == "/start" and arg.startswith("inv_"):
@@ -264,6 +296,21 @@ class Bot:
             return await self.send_users(chat)
         if action == "status":
             return await self.send(chat, self.status_text())
+        if action == "ctl":
+            return await self.send_control(chat)
+        if action == "esc":
+            return await self.do_remote(chat, {"cmd": "key", "key": "esc"})
+        if action == "tap" and arg.isdigit() and int(arg) < len(store.taps):
+            t = store.taps[int(arg)]
+            return await self.do_remote(chat, {"cmd": "tap", "x": t["x"], "y": t["y"]}, t["name"])
+        if action == "tapdel":
+            if arg.isdigit():
+                store.del_tap(int(arg))
+            if not store.taps:
+                return await self.send_control(chat)
+            rows = [[{"text": f"❌ {t['name']}", "callback_data": f"tapdel:{i}"}] for i, t in enumerate(store.taps)]
+            rows.append([{"text": "← Готово", "callback_data": "ctl"}])
+            return await self.send(chat, "Какую кнопку удалить?", {"inline_keyboard": rows})
         if action == "guest" and arg.isdigit():
             return await self.send_guest(chat, int(arg))
         if action == "guestclose":
@@ -297,6 +344,51 @@ class Bot:
     async def edit(self, msg: dict, text: str):
         await self.call("editMessageText", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
                         text=text, parse_mode="HTML")
+
+    # ------------------------------------------------------------ remote control
+    def control_kb(self):
+        rows = [[{"text": "⬅️ Назад (Esc)", "callback_data": "esc"},
+                 {"text": "🔄 Обновить снимок", "callback_data": "ctl"}]]
+        taps = [{"text": f"🖱 {t['name']}", "callback_data": f"tap:{i}"} for i, t in enumerate(store.taps)]
+        rows += [taps[i:i + 2] for i in range(0, len(taps), 2)]
+        if self.public_url.startswith("https://"):
+            rows.append([{"text": "👆 Нажать по картинке / добавить кнопку",
+                          "web_app": {"url": self.public_url + "/?control=1"}}])
+        if store.taps:
+            rows.append([{"text": "🗑 Удалить кнопку", "callback_data": "tapdel"}])
+        return {"inline_keyboard": rows}
+
+    async def send_photo(self, chat: int, frame: bytes, caption: str, kb=None) -> bool:
+        try:
+            data = {"chat_id": str(chat), "caption": caption}
+            if kb:
+                data["reply_markup"] = json.dumps(kb)
+            r = await self.client.post(f"{self.base}/sendPhoto", data=data,
+                                       files={"photo": ("shot.jpg", frame, "image/jpeg")})
+            if r.json().get("ok"):
+                return True
+            log.warning("sendPhoto: %s", r.json().get("description"))
+        except Exception as e:
+            log.warning("sendPhoto недоступен: %s", e)
+        return False
+
+    async def send_control(self, chat: int, note: str = ""):
+        """Whole window as it is on the PC right now + the control buttons."""
+        frame = await self.remote.fresh_full() if self.remote else None
+        head = (note + "\n" if note else "") + "Окно на ПК сейчас. Что нажать?"
+        if frame and await self.send_photo(chat, frame, head, self.control_kb()):
+            return
+        why = "ПК не в сети или программа на ПК старее 0.1.6, снимка окна нет."
+        await self.send(chat, (note + "\n" if note else "") + f"🎮 Управление. {why}", self.control_kb())
+
+    async def do_remote(self, chat: int, cmd: dict, label: str = ""):
+        if not self.remote:
+            return await self.send(chat, "Управление не настроено.")
+        res = await self.remote.command(cmd)
+        if not res["ok"]:
+            return await self.send(chat, f"⚠️ Не получилось: {html.escape(res['msg'])}", self.control_kb())
+        await asyncio.sleep(1.2)                       # let the window react before the snapshot
+        await self.send_control(chat, f"✅ {label + ': ' if label else ''}{res['msg']}")
 
     async def send_shot(self, chat: int, uid: int):
         now = time.time()
@@ -363,6 +455,7 @@ class Bot:
         await self.call("setMyCommands", commands=[
             {"command": "start", "description": "Открыть трансляцию"},
             {"command": "shot", "description": "Снимок: текущий кадр"},
+            {"command": "control", "description": "Управление: закрыть окно на ПК (админ)"},
             {"command": "guest", "description": "Гостевая ссылка на 15 мин (админ)"},
             {"command": "invite", "description": "Пригласить (админ)"},
             {"command": "users", "description": "Зрители (админ)"},

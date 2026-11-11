@@ -39,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -59,6 +59,7 @@ DEFAULTS = {
     "emulator_shortcut": "",     # BlueStacks app shortcut (.lnk) to (re)start the emulator with the app
     "auto_launch": True,         # start it by itself when the window is missing
     "keep_awake": True,          # don't let the PC sleep / turn the screen off while streaming
+    "remote_control": True,      # admins may click / press Esc in the streamed window from the bot
     "hide_on_minimize": True,    # minimizing the emulator hides it off-screen instead (keeps streaming)
 }
 
@@ -292,6 +293,10 @@ if IS_WIN:
     _sig(user32.GetForegroundWindow, W.HWND)
     _sig(user32.GetSystemMetrics, ctypes.c_int, ctypes.c_int)
     _sig(user32.SetForegroundWindow, W.BOOL, W.HWND)
+    _sig(user32.GetCursorPos, W.BOOL, ctypes.POINTER(W.POINT))
+    _sig(user32.SetCursorPos, W.BOOL, ctypes.c_int, ctypes.c_int)
+    _sig(user32.mouse_event, None, W.DWORD, W.DWORD, W.DWORD, W.DWORD, ctypes.c_void_p)
+    _sig(user32.keybd_event, None, W.BYTE, W.BYTE, W.DWORD, ctypes.c_void_p)
     _sig(user32.GetClientRect, W.BOOL, W.HWND, ctypes.POINTER(W.RECT))
     _sig(user32.ClientToScreen, W.BOOL, W.HWND, ctypes.POINTER(W.POINT))
     _sig(user32.GetDC, W.HDC, W.HWND)
@@ -446,6 +451,9 @@ class WindowSource:
         self.hidden = False           # window parked off-screen by us
         self.home = None              # (x, y) where to put it back
         self.request = None           # "hide" / "show" from the GUI thread
+        self.busy = False             # remote click in progress - hide logic must not interfere
+        self.was_fg = False
+        self.input_lock = threading.Lock()
 
     def grab(self, title: str, sct) -> tuple[Image.Image | None, str]:
         if not title:
@@ -504,6 +512,8 @@ class WindowSource:
 def _wsrc_hide_logic(self) -> str | None:
     """Minimized windows are not rendered by Windows, so 'minimize' = park the window off-screen."""
     hwnd = self.hwnd
+    if self.busy:
+        return None
     if not self.hidden and is_offscreen(hwnd):        # left there by a previous run / update restart
         self.hidden = True
     req, self.request = self.request, None
@@ -538,6 +548,95 @@ def _wsrc_hide_logic(self) -> str | None:
 WindowSource._hide_logic = _wsrc_hide_logic
 
 
+def _wsrc_remote_input(self, action: str, fx: float = 0.0, fy: float = 0.0) -> tuple[bool, str]:
+    """Click at (fx, fy) - fractions of the window's client area - or press Esc in the window.
+
+    A real mouse click, so it works for anything shown in the window (Android popup or the
+    emulator's own dialog). A hidden window is brought back for a moment and parked again.
+    Only ever clicks inside the streamed window.
+    """
+    if not IS_WIN:
+        return False, "работает только на Windows"
+    hwnd = self.hwnd
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False, "окно не найдено (в программе должно быть выбрано окно, а не «Весь экран»)"
+    if action == "tap" and not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+        return False, "точка вне окна"
+    if not self.input_lock.acquire(timeout=6):
+        return False, "ещё выполняю прошлое нажатие"
+    self.busy = True
+    parked = False
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 4)
+            time.sleep(0.3)
+        was_hidden = self.hidden or is_offscreen(hwnd)
+        prev_fg = user32.GetForegroundWindow()
+        vl, vt, vr, vb = virtual_screen()
+        if action == "tap":
+            if was_hidden:
+                x, y = self.home or (vl + 80, vt + 60)
+                move_window(hwnd, x, y)
+                parked = True
+            flags = SWP_NOSIZE | 0x2 | SWP_NOACTIVATE            # 0x2 = SWP_NOMOVE
+            user32.SetWindowPos(hwnd, W.HWND(-1), 0, 0, 0, 0, flags)   # above everything for the click
+            time.sleep(0.25)
+            r = screen_rect(hwnd)
+            px = int(r["left"] + fx * max(1, r["width"] - 1))
+            py = int(r["top"] + fy * max(1, r["height"] - 1))
+            try:
+                if not (vl <= px < vr and vt <= py < vb):
+                    return False, "эта точка окна не помещается на экране ПК"
+                old = W.POINT()
+                user32.GetCursorPos(ctypes.byref(old))
+                user32.SetCursorPos(px, py)
+                time.sleep(0.06)
+                user32.mouse_event(0x0002, 0, 0, 0, None)        # left down
+                time.sleep(0.07)
+                user32.mouse_event(0x0004, 0, 0, 0, None)        # left up
+                time.sleep(0.25)
+                user32.SetCursorPos(old.x, old.y)
+            finally:
+                user32.SetWindowPos(hwnd, W.HWND(-2), 0, 0, 0, 0, flags)   # HWND_NOTOPMOST
+            msg = f"нажал в точку {round(fx * 100)}% × {round(fy * 100)}%"
+        elif action == "esc":
+            if user32.GetForegroundWindow() != hwnd:
+                user32.keybd_event(0x12, 0, 0, None)             # Alt: lets a background app take focus
+                user32.SetForegroundWindow(hwnd)
+                user32.keybd_event(0x12, 0, 0x0002, None)
+                time.sleep(0.3)
+            if user32.GetForegroundWindow() != hwnd:
+                return False, "не смог активировать окно эмулятора"
+            user32.keybd_event(0x1B, 0, 0, None)                 # Esc = Android «Назад» in BlueStacks
+            time.sleep(0.06)
+            user32.keybd_event(0x1B, 0, 0x0002, None)
+            time.sleep(0.25)
+            msg = "нажал «Назад» (Esc)"
+        else:
+            return False, "неизвестная команда"
+        if prev_fg and prev_fg != hwnd and user32.IsWindow(prev_fg):
+            user32.SetForegroundWindow(prev_fg)
+        return True, msg
+    except Exception as e:
+        return False, f"ошибка: {e}"
+    finally:
+        try:
+            if parked:                                           # it was hidden - hide it again
+                l, t, _, _ = window_rect(hwnd)
+                self.home = (l, t)
+                vl, vt, vr, vb = virtual_screen()
+                move_window(hwnd, vr + 200, t if vt <= t < vb else vt)
+                self.hidden = True
+            self.was_fg = user32.GetForegroundWindow() == hwnd
+        except Exception:
+            pass
+        self.busy = False
+        self.input_lock.release()
+
+
+WindowSource.remote_input = _wsrc_remote_input
+
+
 class Capture(threading.Thread):
     def __init__(self, cfg: dict):
         super().__init__(daemon=True)
@@ -554,14 +653,21 @@ class Capture(threading.Thread):
         self.heartbeat = time.monotonic()
         self.status = "Запуск…"
         self.src = WindowSource()
+        self.full_until = 0.0         # admin's control view is open: also send the whole window
+        self.full_jpeg = None
+        self.full_seq = 0
 
     def get_jpeg(self):
         with self.lock:
             return self.jpeg_seq, self.jpeg
 
+    def get_full(self):
+        with self.lock:
+            return self.full_seq, self.full_jpeg
+
     def run(self):
         sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
-        last_digest, last_sent, last_preview = None, 0.0, 0.0
+        last_digest, last_sent, last_preview, last_full = None, 0.0, 0.0, 0.0
         while not self.stop_ev.is_set():
             t0 = time.monotonic()
             self.heartbeat = t0
@@ -579,6 +685,15 @@ class Capture(threading.Thread):
                         self.preview = pv
                         self.preview_seq += 1
                     last_preview = t0
+                if self.streaming and t0 < self.full_until and t0 - last_full >= 0.6:
+                    full = img.copy()
+                    full.thumbnail((1280, 1280))
+                    buf = io.BytesIO()
+                    full.save(buf, "JPEG", quality=60)
+                    with self.lock:
+                        self.full_jpeg = buf.getvalue()
+                        self.full_seq += 1
+                    last_full = t0
                 if self.streaming:
                     out = img
                     c = cfg.get("crop")
@@ -621,6 +736,8 @@ class Net(threading.Thread):
         self.bytes = 0
         self.send_avg = 0.0           # smoothed seconds per frame upload
         self.last_sent = time.monotonic()
+        self.last_remote = ""         # last remote action, shown in the status line
+        self._tasks: set = set()
 
     def stop(self):
         self.stop_ev.set()
@@ -640,8 +757,38 @@ class Net(threading.Thread):
                     m = json.loads(msg)
                     if "viewers" in m:
                         self.viewers = m["viewers"]
+                    if isinstance(m, dict) and m.get("cmd"):
+                        t = asyncio.create_task(self._handle_cmd(ws, m))
+                        self._tasks.add(t)
+                        t.add_done_callback(self._tasks.discard)
                 except ValueError:
                     pass
+
+    async def _handle_cmd(self, ws, m: dict):
+        """Commands from the bot / admin's control view: whole-window frames, click, Esc."""
+        cmd = m.get("cmd")
+        if cmd == "control":
+            self.cap.full_until = time.monotonic() + 30 if m.get("on") else 0.0
+            return
+        if cmd not in ("tap", "key"):
+            return
+        if not self.cap.cfg.get("remote_control", True):
+            ok, msg = False, "нажатия выключены в программе на ПК (галочка «Разрешить нажатия из бота»)"
+        else:
+            loop = asyncio.get_running_loop()
+            try:
+                if cmd == "tap":
+                    ok, msg = await loop.run_in_executor(
+                        None, self.cap.src.remote_input, "tap", float(m.get("x", -1)), float(m.get("y", -1)))
+                else:
+                    ok, msg = await loop.run_in_executor(None, self.cap.src.remote_input, "esc")
+            except Exception as e:
+                ok, msg = False, f"ошибка: {e}"
+        self.last_remote = f"{time.strftime('%H:%M:%S')} бот: {msg}"
+        try:
+            await ws.send(json.dumps({"type": "result", "id": m.get("id"), "ok": ok, "msg": msg}))
+        except Exception:
+            pass
 
     async def _main(self):
         backoff = 1
@@ -651,17 +798,22 @@ class Net(threading.Thread):
                 self.state, self.message = "connecting", "Подключение к серверу…"
                 async with connect(self.server, max_size=None, ping_interval=20,
                                    open_timeout=10, close_timeout=2) as ws:
-                    await ws.send(json.dumps({"token": self.token}))
+                    await ws.send(json.dumps({"token": self.token, "v": APP_VERSION, "caps": ["control"]}))
                     reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
                     if not reply.get("ok"):
                         raise ConnectionError("сервер не принял токен")
                     self.state, self.message, backoff = "live", "В эфире", 1
                     reader = asyncio.create_task(self._reader(ws))
                     last_seq = -1
+                    last_full = self.cap.get_full()[0]
                     while not self.stop_ev.is_set():
                         if reader.done():
                             reader.result()          # raises if the connection died
                             raise ConnectionError("соединение закрыто")
+                        fseq, fdata = self.cap.get_full()
+                        if fdata and fseq != last_full:
+                            last_full = fseq
+                            await asyncio.wait_for(ws.send(b"F" + fdata), 20)   # "F" = whole window, admins only
                         seq, data = self.cap.get_jpeg()
                         if data and seq != last_seq:
                             ts = time.monotonic()
@@ -977,6 +1129,9 @@ class App:
         self.hidemin_var = tk.BooleanVar(value=self.cfg["hide_on_minimize"])
         ttk.Checkbutton(bottom, text="Свернул BlueStacks - прятать за край экрана (трансляция идёт дальше)",
                         variable=self.hidemin_var, command=self.on_option).pack(anchor="w")
+        self.remote_var = tk.BooleanVar(value=self.cfg["remote_control"])
+        ttk.Checkbutton(bottom, text="Разрешить нажатия из бота (закрыть всплывшее окно кнопкой или тапом по картинке)",
+                        variable=self.remote_var, command=self.on_option).pack(anchor="w")
         self.awake_var = tk.BooleanVar(value=self.cfg["keep_awake"])
         ttk.Checkbutton(bottom, text="Не давать ПК засыпать и гасить экран во время трансляции",
                         variable=self.awake_var, command=self.on_awake).pack(anchor="w")
@@ -1031,6 +1186,7 @@ class App:
                         auto_launch=bool(self.launch_var.get()),
                         keep_awake=bool(self.awake_var.get()),
                         hide_on_minimize=bool(self.hidemin_var.get()),
+                        remote_control=bool(self.remote_var.get()),
                         server=self.server_var.get().strip(), token=self.token_var.get().strip())
         self.push_cfg()
 
@@ -1296,7 +1452,8 @@ class App:
                     self.update_tray("retry", f"{APP_NAME}: {net.message}")
                 w, h = self.cap.out_size
                 auto = f" · авто-качество {int(self.cap.scale * 100)}% (медленный интернет)" if self.cap.scale < 0.99 else ""
-                self.info_label.config(text=f"{src_status}" + (f" · кадр {w}×{h}" if w else "") + auto)
+                remote = f" · {net.last_remote}" if net.last_remote else ""
+                self.info_label.config(text=f"{src_status}" + (f" · кадр {w}×{h}" if w else "") + auto + remote)
             else:
                 self.info_label.config(text=src_status)
         finally:
@@ -1649,12 +1806,27 @@ def selftest() -> int:
             t.title("SR hide test")
             t.geometry("300x200+100+100")
             tk.Frame(t, bg="#ff0000", width=300, height=200).pack(fill="both", expand=True)
-            for _ in range(20):
-                t.update()
-                time.sleep(0.05)
+            hits = []
+            tk.Button(t, bg="#ff0000", activebackground="#ff0000", relief="flat", bd=0,
+                      command=lambda: hits.append("tap")).place(relx=0.05, rely=0.3, relwidth=0.4, relheight=0.4)
+            t.bind("<Escape>", lambda e: hits.append("esc"))
+
+            def pump(n=10):
+                for _ in range(n):
+                    t.update()
+                    time.sleep(0.05)
+
+            pump(20)
             hw = find_window("SR hide test")
             src = WindowSource()
             src.hwnd, src.title = hw, "SR hide test"
+            r1 = src.remote_input("tap", 0.25, 0.5)
+            pump()
+            tap_ok = "tap" in hits
+            r2 = src.remote_input("esc")
+            pump()
+            esc_ok = "esc" in hits
+            remote = f" tap={'ok' if tap_ok else 'FAIL ' + r1[1]} esc={'ok' if esc_ok else 'FAIL ' + r2[1]}"
             src.request = "hide"
             src._hide_logic()
             for _ in range(10):
@@ -1664,12 +1836,16 @@ def selftest() -> int:
             w, h = client_size(hw)
             img = print_window(hw, w, h)
             red = img is not None and img.resize((1, 1)).getpixel((0, 0))[0] > 150
+            del hits[:]
+            r3 = src.remote_input("tap", 0.25, 0.5)      # hidden: comes back, gets clicked, hides again
+            pump()
+            remote += f" tap_hidden={'ok' if 'tap' in hits and is_offscreen(hw) else 'FAIL ' + r3[1]}"
             src.request = "show"
             src._hide_logic()
             back = not is_offscreen(hw)
             t.destroy()
             assert off and back, f"hide/show failed off={off} back={back}"
-            extra += f" hide=ok offscreen_capture={'ok' if red else 'BLACK'}"
+            extra += f" hide=ok offscreen_capture={'ok' if red else 'BLACK'}{remote}"
         log.write_text(f"OK windows={len(titles)} tray={pystray.Icon.__module__}{extra}\n", encoding="utf-8")
         return 0
     except Exception as e:

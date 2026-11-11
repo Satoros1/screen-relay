@@ -26,6 +26,24 @@
   #login form { display:flex; flex-direction:column; gap:10px; width:min(320px, 90vw); }
   #login input { padding:10px; border-radius:8px; border:1px solid #333; background:#17191e; color:var(--fg); font:inherit; }
   #login .err { color:var(--bad); min-height:1em; }
+  /* admin control mode: tap on the picture = click on the PC */
+  #ctlBtn { display:none; }
+  #panel { position:fixed; left:0; right:0; bottom:0; display:none; flex-direction:column; gap:8px; z-index:2;
+    padding:10px 12px; padding-bottom:max(10px, env(safe-area-inset-bottom)); background:rgba(0,0,0,.8); }
+  #panel .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  #panel input { flex:1; min-width:120px; padding:7px 9px; border-radius:8px; border:1px solid #333;
+    background:#17191e; color:var(--fg); font:inherit; }
+  #ctlMsg { font-size:13px; min-height:1.3em; }
+  #saveRow { display:none; }
+  body.ctl #panel { display:flex; }
+  body.ctl #stage { top:44px; bottom:var(--panel-h, 150px); }
+  body.ctl canvas { cursor:crosshair; touch-action:manipulation; }
+  body.ctl #stale { display:none !important; }
+  body.ctl #ctlBtn { background:var(--ok); color:#000; }
+  #mark { position:fixed; width:34px; height:34px; margin:-17px 0 0 -17px; border:3px solid var(--ok);
+    border-radius:50%; pointer-events:none; opacity:0; z-index:2; }
+  #mark.on { animation:ping .7s ease-out; }
+  @keyframes ping { from { opacity:1; transform:scale(.4); } to { opacity:0; transform:scale(1.5); } }
 </style>
 </head>
 <body>
@@ -33,8 +51,24 @@
   <div id="dot"></div><span id="state">Подключение…</span>
   <span id="fps" class="muted"></span>
   <span id="spacer"></span>
+  <button id="ctlBtn" title="Управление: нажать в окне на ПК">🎮</button>
   <button id="fs" title="Во весь экран">⛶</button>
 </div>
+<div id="panel">
+  <div id="ctlMsg">Подключаюсь…</div>
+  <div class="row" id="tapRow"></div>
+  <form class="row" id="saveRow">
+    <input id="saveName" maxlength="24" placeholder="Название кнопки, например «Закрыть рекламу»">
+    <button type="submit">Сохранить</button>
+  </form>
+  <div class="row">
+    <button id="escBtn">⬅️ Назад</button>
+    <button id="saveBtn">💾 Сохранить точку кнопкой</button>
+    <span style="flex:1"></span>
+    <button id="ctlClose">✖ Выйти</button>
+  </div>
+</div>
+<div id="mark"></div>
 <div id="stage"><canvas id="cv"></canvas></div>
 <div id="stale">Нет сигнала от ПК</div>
 <div id="login">
@@ -65,11 +99,17 @@
 
   let ws = null, backoff = 500, frames = 0, lastFrameAt = 0, decoding = false, pending = null;
   let lastMsgAt = 0, serverLive = false, guestUntil = null, ended = false;
+  let ctl = null, ctlOn = false, lastTap = null, tapBusy = 0;
+  let wantCtl = new URLSearchParams(location.search).get('control') === '1';
   const guest = new URLSearchParams(location.search).get('g');
 
   function setState(text, color) { $('state').textContent = text; $('dot').style.background = color; }
 
-  async function draw(blob) {
+  async function draw(blob, fromCtl) {
+    if (ctlOn !== !!fromCtl) {                  // control mode shows the whole window instead of the stream
+      if (!fromCtl) lastFrameAt = performance.now();
+      return;
+    }
     if (decoding) { pending = blob; return; }   // keep only the newest frame
     decoding = true;
     try {
@@ -80,7 +120,7 @@
       frames++; lastFrameAt = performance.now();
     } catch (e) { /* broken frame, skip */ }
     decoding = false;
-    if (pending) { const b = pending; pending = null; draw(b); }
+    if (pending) { const b = pending; pending = null; draw(b, ctlOn); }
   }
 
   function showLogin(msg) {
@@ -138,6 +178,10 @@
           store.clear(); showLogin('Неверный ключ'); return;
         }
         authed = true; backoff = 500; guestUntil = m.until || null; setState('Ожидание кадров…', 'var(--warn)');
+        if (m.admin && inTelegram) {
+          $('ctlBtn').style.display = 'block';
+          if (wantCtl) { wantCtl = false; ctlStart(); }
+        }
       } else if (m.type === 'status') {
         const live = m.online && m.age !== null && m.age < 5;
         serverLive = live;
@@ -154,6 +198,122 @@
       backoff = Math.min(backoff * 2, 10000);
     };
   }
+
+  // ---------------------------------------------------------------- admin control mode
+  const ctlMsg = (t, color) => { $('ctlMsg').textContent = t; $('ctlMsg').style.color = color || 'var(--fg)'; };
+  const fitPanel = () => document.body.style.setProperty('--panel-h', $('panel').offsetHeight + 'px');
+
+  function renderTaps(taps) {
+    const row = $('tapRow');
+    row.textContent = '';
+    (taps || []).forEach(t => {
+      const b = document.createElement('button');
+      b.textContent = '🖱 ' + t.name;
+      b.addEventListener('click', () => sendTap(t.x, t.y, null));
+      row.appendChild(b);
+    });
+    fitPanel();
+  }
+
+  function ctlSend(obj) {
+    if (ctl && ctl.readyState === WebSocket.OPEN) { ctl.send(JSON.stringify(obj)); return true; }
+    ctlMsg('Нет связи с сервером', 'var(--bad)');
+    return false;
+  }
+
+  function sendTap(x, y, ev) {
+    if (Date.now() - tapBusy < 15000) return;          // one click at a time
+    if (!ctlSend({ type: 'tap', x, y })) return;
+    tapBusy = Date.now();
+    lastTap = { x, y };
+    ctlMsg('Нажимаю на ПК…', 'var(--warn)');
+    if (ev) {
+      const mk = $('mark');
+      mk.style.left = ev.clientX + 'px'; mk.style.top = ev.clientY + 'px';
+      mk.classList.remove('on'); void mk.offsetWidth; mk.classList.add('on');
+    }
+  }
+
+  cv.addEventListener('click', ev => {
+    if (!ctlOn || !cv.width) return;
+    const r = cv.getBoundingClientRect();                // the picture is letterboxed inside the canvas box
+    const k = Math.min(r.width / cv.width, r.height / cv.height);
+    const w = cv.width * k, h = cv.height * k;
+    const x = (ev.clientX - r.left - (r.width - w) / 2) / w;
+    const y = (ev.clientY - r.top - (r.height - h) / 2) / h;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;
+    sendTap(x, y, ev);
+  });
+
+  function ctlConnect() {
+    if (!ctlOn) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ctl = new WebSocket(`${proto}://${location.host}/control`);
+    ctl.binaryType = 'blob';
+    ctl.onopen = () => ctl.send(JSON.stringify({ initData: tg.initData }));
+    ctl.onmessage = ev => {
+      if (typeof ev.data !== 'string') { draw(ev.data, true); return; }
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'auth') {
+        if (!m.ok) { ctlMsg('Управление доступно только админу', 'var(--bad)'); return; }
+        renderTaps(m.taps);
+        ctlMsg('Нажми на картинку: кликну в это же место на ПК.');
+      } else if (m.type === 'status') {
+        if (!m.online) ctlMsg('ПК не в сети', 'var(--bad)');
+        else if (!m.supported) ctlMsg('Обнови программу на ПК до 0.1.6 («Проверить обновления»)', 'var(--bad)');
+      } else if (m.type === 'result') {
+        tapBusy = 0;
+        ctlMsg((m.ok ? '✅ ' : '⚠️ ') + m.msg, m.ok ? 'var(--ok)' : 'var(--bad)');
+      } else if (m.type === 'taps') {
+        renderTaps(m.taps);
+        ctlMsg(m.saved === false ? 'Кнопок слишком много, удали лишние в боте' :
+               'Готово: кнопки есть в боте в «🎮 Управление»', m.saved === false ? 'var(--bad)' : 'var(--ok)');
+      }
+    };
+    ctl.onclose = ev => {
+      ctl = null;
+      if (ctlOn && ev.code !== 4403) setTimeout(ctlConnect, 1500);
+    };
+  }
+
+  function ctlStart() {
+    if (ctlOn) return;
+    ctlOn = true; pending = null; tapBusy = 0;
+    document.body.classList.add('ctl');
+    ctlMsg('Подключаюсь…');
+    fitPanel();
+    ctlConnect();
+  }
+
+  function ctlStop() {
+    ctlOn = false; pending = null;
+    document.body.classList.remove('ctl');
+    $('saveRow').style.display = 'none';
+    if (ctl) { try { ctl.close(); } catch (e) {} }
+  }
+
+  $('ctlBtn').addEventListener('click', () => ctlOn ? ctlStop() : ctlStart());
+  $('ctlClose').addEventListener('click', ctlStop);
+  $('escBtn').addEventListener('click', () => {
+    if (Date.now() - tapBusy < 15000) return;
+    if (ctlSend({ type: 'key', key: 'esc' })) { tapBusy = Date.now(); ctlMsg('Нажимаю «Назад» на ПК…', 'var(--warn)'); }
+  });
+  $('saveBtn').addEventListener('click', () => {
+    if (!lastTap) { ctlMsg('Сначала нажми на картинке в нужное место, потом сохраняй.', 'var(--warn)'); return; }
+    $('saveRow').style.display = 'flex';
+    fitPanel();
+    $('saveName').focus();
+  });
+  $('saveRow').addEventListener('submit', e => {
+    e.preventDefault();
+    const name = $('saveName').value.trim();
+    if (!name || !lastTap) return;
+    if (ctlSend({ type: 'save', name, x: lastTap.x, y: lastTap.y })) {
+      $('saveName').value = '';
+      $('saveRow').style.display = 'none';
+      fitPanel();
+    }
+  });
 
   // watchdog: the connection looks open but nothing arrives (sleeping phone, stuck proxy) -> reconnect
   setInterval(() => {
