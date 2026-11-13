@@ -16,7 +16,9 @@ import logging
 import os
 import secrets
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -27,6 +29,22 @@ STORE = DATA_DIR / "users.json"
 INVITE_TTL = 24 * 3600
 REQUEST_COOLDOWN = 600
 MAX_TAPS = 12
+MAX_RULES = 5
+
+try:
+    TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Amsterdam"))
+except Exception:
+    TZ = None
+
+
+def hhmm(ts: float, seconds: bool = False) -> str:
+    """Clock time in the owner's time zone (the server itself runs in UTC)."""
+    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S" if seconds else "%H:%M")
+
+
+def left_text(sec: float) -> str:
+    m = max(0, int((sec + 59) // 60))
+    return f"{m // 60} ч {m % 60:02d} мин" if m >= 60 else f"{m} мин"
 
 
 def _ids(raw: str) -> set[int]:
@@ -46,6 +64,8 @@ class Store:
         self.invites: dict[str, float] = {}    # code -> expires_at
         self.guests: dict[str, float] = {}     # browser guest token -> access ends at
         self.taps: list[dict] = []             # saved click points: {"name", "x", "y"} (fractions of the window)
+        self.rules: list[dict] = []            # auto-click rules: popup template + where to click + timer hours
+        self.timer: dict | None = None         # running timer: {"name", "start", "end", "hours", "warn", "msgs"}
         self.requests: dict[str, float] = {}   # "id" -> last request time (not saved)
         self.load()
 
@@ -57,6 +77,8 @@ class Store:
             self.invites = {k: v for k, v in data.get("invites", {}).items() if v > now}
             self.guests = {k: v for k, v in data.get("guests", {}).items() if v > now}
             self.taps = [t for t in data.get("taps", []) if isinstance(t, dict) and "name" in t][:MAX_TAPS]
+            self.rules = [r for r in data.get("rules", []) if isinstance(r, dict) and r.get("tpl")][:MAX_RULES]
+            self.timer = data.get("timer") or None
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -67,7 +89,7 @@ class Store:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STORE.with_suffix(".tmp")
             tmp.write_text(json.dumps({"users": self.users, "invites": self.invites, "guests": self.guests,
-                                       "taps": self.taps},
+                                       "taps": self.taps, "rules": self.rules, "timer": self.timer},
                                       ensure_ascii=False, indent=1), encoding="utf-8")
             tmp.replace(STORE)
         except Exception as e:
@@ -109,6 +131,31 @@ class Store:
             self.save()
             return True
         return False
+
+    def add_rule(self, rule: dict) -> bool:
+        self.rules = [r for r in self.rules if r["name"] != rule["name"]]      # same name = replace
+        if len(self.rules) >= MAX_RULES:
+            return False
+        self.rules.append(rule)
+        self.save()
+        return True
+
+    def del_rule(self, rule_id) -> bool:
+        n = len(self.rules)
+        self.rules = [r for r in self.rules if r["id"] != rule_id]
+        if len(self.rules) != n:
+            self.save()
+            return True
+        return False
+
+    def rule(self, rule_id) -> dict | None:
+        return next((r for r in self.rules if r["id"] == rule_id), None)
+
+    def rules_public(self) -> list[dict]:
+        return [{k: r[k] for k in ("id", "name", "timer_h")} for r in self.rules]
+
+    def timer_active(self) -> bool:
+        return bool(self.timer) and self.timer["end"] > time.time()
 
     def new_guest(self, minutes: int) -> tuple[str, float]:
         now = time.time()
@@ -159,6 +206,7 @@ class Bot:
         self.shot_at: dict[int, float] = {}
         self._kick_guests = kick_guests
         self.remote = remote              # click / Esc on the PC, whole-window snapshots
+        self._timer_task = None
         self.username = ""
         self.client = httpx.AsyncClient(timeout=70)
 
@@ -251,7 +299,9 @@ class Bot:
                 "Скинул другу, он посмотрел, потом доступ сам пропадает (/guest 30 - на 30 мин).\n"
                 "📸 <b>Снимок</b> (/shot): текущий кадр картинкой.\n"
                 "🎮 <b>Управление</b> (/control): выскочило окно и закрыло статистику - нажми «Назад» "
-                "или свою сохранённую кнопку, я кликну на ПК и пришлю снимок.\n\n"
+                "или свою сохранённую кнопку, я кликну на ПК и пришлю снимок.\n"
+                "🎯 <b>Авто-нажатия</b>: программа сама замечает окно (например, «Enjoy your workout»), "
+                "нажимает кнопку и запускает таймер. Настройка: 🎮 → Mini App → «🎯 Авто-нажатие».\n\n"
                 "Команды: /control /guest /shot /invite /users /status /add &lt;id&gt;",
                 self.admin_kb())
 
@@ -311,6 +361,28 @@ class Bot:
             rows = [[{"text": f"❌ {t['name']}", "callback_data": f"tapdel:{i}"}] for i, t in enumerate(store.taps)]
             rows.append([{"text": "← Готово", "callback_data": "ctl"}])
             return await self.send(chat, "Какую кнопку удалить?", {"inline_keyboard": rows})
+        if action == "auto":
+            return await self.send_rules(chat)
+        if action == "ruledel" and arg:
+            if store.del_rule(arg) and self.remote:
+                await self.remote.push_rules()
+            return await self.send_rules(chat)
+        if action == "rulefire" and arg:
+            if not store.rule(arg):
+                return await self.send_rules(chat)
+            res = await self.remote.command({"cmd": "fire", "rule": arg}, need="auto") if self.remote \
+                else {"ok": False, "msg": "управление не настроено"}
+            if not res["ok"]:
+                return await self.send(chat, f"⚠️ {html.escape(res['msg'])}")
+            return await self.send(chat, "⏳ Нажимаю на ПК… Таймер придёт отдельным сообщением.")
+        if action == "timerstart" and arg:
+            rule = store.rule(arg)
+            if rule:
+                await self.start_timer(rule, True, "запущен вручную")
+            return
+        if action == "timerstop":
+            await self.stop_timer(chat)
+            return
         if action == "guest" and arg.isdigit():
             return await self.send_guest(chat, int(arg))
         if action == "guestclose":
@@ -354,9 +426,118 @@ class Bot:
         if self.public_url.startswith("https://"):
             rows.append([{"text": "👆 Нажать по картинке / добавить кнопку",
                           "web_app": {"url": self.public_url + "/?control=1"}}])
+        last = []
         if store.taps:
-            rows.append([{"text": "🗑 Удалить кнопку", "callback_data": "tapdel"}])
+            last.append({"text": "🗑 Удалить кнопку", "callback_data": "tapdel"})
+        last.append({"text": f"🎯 Авто-нажатия ({len(store.rules)})", "callback_data": "auto"})
+        rows.append(last)
         return {"inline_keyboard": rows}
+
+    # ------------------------------------------------------------ auto rules + timer
+    async def send_rules(self, chat: int):
+        rows, lines = [], []
+        for r in store.rules:
+            t = f", таймер {r['timer_h']:g} ч" if r.get("timer_h") else ""
+            lines.append(f"• <b>{html.escape(r['name'])}</b>: нажать в ({round(r['tap'][0] * 100)}%, "
+                         f"{round(r['tap'][1] * 100)}%){t}")
+            row = [{"text": f"▶ Нажать сейчас: {r['name'][:18]}", "callback_data": f"rulefire:{r['id']}"}]
+            if r.get("timer_h"):
+                row.append({"text": "⏱ Только таймер", "callback_data": f"timerstart:{r['id']}"})
+            rows.append(row)
+            rows.append([{"text": f"❌ Удалить «{r['name'][:20]}»", "callback_data": f"ruledel:{r['id']}"}])
+        text = ("🎯 <b>Авто-нажатия</b>\nПрограмма на ПК раз в секунду ищет окно; увидела - нажимает "
+                "кнопку, проверяет, что окно пропало, и запускает таймер.\n\n" +
+                ("\n".join(lines) if lines else "Пока нет ни одного.") +
+                "\n\nДобавить: «👆 Нажать по картинке» → «🎯 Авто-нажатие», пока окно открыто на ПК.")
+        if self.public_url.startswith("https://"):
+            rows.append([{"text": "👆 Настроить в Mini App", "web_app": {"url": self.public_url + "/?control=1"}}])
+        rows.append([{"text": "← Управление", "callback_data": "ctl"}])
+        await self.send(chat, text, {"inline_keyboard": rows})
+
+    async def on_auto_event(self, ev: dict):
+        """The PC saw a learned popup and pressed its button."""
+        rule = store.rule(ev.get("rule"))
+        if not rule:
+            return
+        ok, msg = bool(ev.get("ok")), str(ev.get("msg", ""))[:150]
+        log.info("авто «%s»: %s", rule["name"], msg)
+        if rule.get("timer_h"):
+            if store.timer_active():
+                log.info("таймер уже идёт - повторное окно игнорирую")
+                return
+            await self.start_timer(rule, ok, msg, ev.get("at"))
+        elif not ok:
+            for a in ADMINS:
+                await self.send(a, f"⚠️ Авто-нажатие «{html.escape(rule['name'])}»: {html.escape(msg)}",
+                                self.control_kb())
+
+    def timer_text(self) -> str:
+        t = store.timer
+        left = t["end"] - time.time()
+        text = (f"🏋️ <b>{html.escape(t['name'])}</b> в {hhmm(t['start'])}\n"
+                f"⏳ Осталось: <b>{left_text(left)}</b>\n"
+                f"🕒 {t['hours']:g} ч пройдут в <b>{hhmm(t['end'])}</b>")
+        if t.get("warn"):
+            text += f"\n⚠️ {html.escape(t['warn'])}"
+        return text
+
+    @staticmethod
+    def timer_kb():
+        return {"inline_keyboard": [[{"text": "⏹ Сбросить таймер", "callback_data": "timerstop"}]]}
+
+    async def start_timer(self, rule: dict, ok: bool, msg: str, at: float | None = None):
+        start = at if at and abs(time.time() - at) < 600 else time.time()
+        hours = float(rule.get("timer_h") or 3)
+        store.timer = {"name": rule["name"], "start": start, "end": start + hours * 3600, "hours": hours,
+                       "warn": "" if ok else f"окно не закрылось сам ({msg}) - открой 🎮 Управление",
+                       "msgs": {}}
+        for a in ADMINS:
+            res = await self.send(a, self.timer_text(), self.timer_kb())
+            mid = ((res or {}).get("result") or {}).get("message_id")
+            if mid:
+                store.timer["msgs"][str(a)] = mid
+        store.save()
+        self.ensure_timer_loop()
+
+    def ensure_timer_loop(self):
+        if store.timer and (not self._timer_task or self._timer_task.done()):
+            self._timer_task = asyncio.create_task(self.timer_loop())
+
+    async def timer_loop(self):
+        """Edit the timer messages every minute; when time is up delete them and say so."""
+        t = store.timer
+        while store.timer is t:
+            left = t["end"] - time.time()
+            if left <= 0:
+                await self.finish_timer(t)
+                return
+            await asyncio.sleep(min(left, (left % 60) or 60) + 0.5)
+            if store.timer is not t or t["end"] - time.time() <= 0:
+                continue
+            for chat, mid in list(t["msgs"].items()):
+                await self.call("editMessageText", chat_id=int(chat), message_id=mid, text=self.timer_text(),
+                                parse_mode="HTML", reply_markup=self.timer_kb())
+
+    async def delete_timer_msgs(self, t: dict):
+        for chat, mid in t.get("msgs", {}).items():
+            await self.call("deleteMessage", chat_id=int(chat), message_id=mid)
+
+    async def finish_timer(self, t: dict):
+        store.timer = None
+        store.save()
+        await self.delete_timer_msgs(t)
+        for a in ADMINS:
+            await self.send(a, f"✅ {t['hours']:g} ч прошли ({html.escape(t['name'])} в {hhmm(t['start'])}) - "
+                               f"можно уходить.")
+
+    async def stop_timer(self, chat: int):
+        t = store.timer
+        if not t:
+            return await self.send(chat, "Таймер не идёт.")
+        store.timer = None
+        store.save()
+        await self.delete_timer_msgs(t)
+        await self.send(chat, "⏹ Таймер сброшен.")
 
     async def send_photo(self, chat: int, frame: bytes, caption: str, kb=None) -> bool:
         try:
@@ -399,7 +580,7 @@ class Bot:
         if not frame:
             return await self.send(chat, "🔴 Кадров пока нет: ПК не в сети или трансляция не запущена.")
         age = int(now - ts)
-        when = time.strftime("%H:%M:%S", time.localtime(ts))
+        when = hhmm(ts, seconds=True)
         caption = f"📸 {when}" + (f"  ⚠️ кадр старый ({age // 60} мин) - ПК не в сети?" if age > 60 else "")
         try:
             r = await self.client.post(
@@ -417,7 +598,7 @@ class Bot:
             return await self.send(chat, "Не задан PUBLIC_URL в .env")
         token, until = store.new_guest(minutes)
         link = f"{self.public_url}/?g={token}"
-        end = time.strftime("%H:%M", time.localtime(until))
+        end = hhmm(until)
         await self.send(chat,
                         f"⏱ Гостевая ссылка на <b>{minutes} мин</b> (до {end}). "
                         f"Откроется в любом браузере, Telegram не нужен:\n\n{link}\n\n"
@@ -462,6 +643,7 @@ class Bot:
             {"command": "status", "description": "Статус трансляции"},
         ])
         log.info("бот @%s запущен, админы: %s", self.username, sorted(ADMINS))
+        self.ensure_timer_loop()          # a timer that was running before a restart / update
         offset = 0
         while True:
             try:

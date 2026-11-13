@@ -10,6 +10,7 @@ skip frames instead of building up delay.
 import asyncio
 import hashlib
 import hmac
+import secrets
 import json
 import logging
 import os
@@ -130,9 +131,15 @@ def status_text() -> str:
     st = stream_state()
     head = {"live": "🟢 В эфире", "no_frames": "🟠 ПК на связи, кадров нет", "offline": "🔴 ПК не в сети"}[st]
     age = f", последний кадр {round(time.time() - hub.frame_ts)} с назад" if hub.frame_ts else ""
-    return f"{head}{age}\nСмотрят сейчас: {hub.viewers}\nЗрителей с доступом: {len(tgbot.store.users)}"
+    text = f"{head}{age}\nСмотрят сейчас: {hub.viewers}\nЗрителей с доступом: {len(tgbot.store.users)}"
+    t = tgbot.store.timer
+    if tgbot.store.timer_active():
+        text += (f"\n🏋️ {t['name']} в {tgbot.hhmm(t['start'])}, осталось {tgbot.left_text(t['end'] - time.time())}"
+                 f" (до {tgbot.hhmm(t['end'])})")
+    return text
 
 
+BOT = None                          # tgbot.Bot when BOT_TOKEN is set
 VIEWER_SOCKETS: dict[int, set] = {}
 GUEST_SOCKETS: set = set()
 
@@ -161,8 +168,9 @@ async def lifespan(_app):
         tasks.append(asyncio.create_task(setup_menu_button()))
         if ALERTS and tgbot.ADMINS:
             tasks.append(asyncio.create_task(watchdog()))
-        b = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer,
-                      lambda: (hub.frame, hub.frame_ts), kick_guests, remote)
+        global BOT
+        b = BOT = tgbot.Bot(BOT_TOKEN, TG_API, PUBLIC_URL, status_text, kick_viewer,
+                            lambda: (hub.frame, hub.frame_ts), kick_guests, remote)
         tasks.append(asyncio.create_task(b.run()))
     yield
     for t in tasks:
@@ -224,12 +232,16 @@ class Hub:
 
     def status(self) -> dict:
         age = round(time.time() - self.frame_ts, 1) if self.frame_ts else None
-        return {
+        st = {
             "type": "status",
             "online": self.publisher_online,
             "age": age,
             "viewers": self.viewers,
         }
+        if tgbot.store.timer_active():
+            st["busy_until"] = tgbot.store.timer["end"]
+            st["busy_name"] = tgbot.store.timer["name"]
+        return st
 
 
 hub = Hub()
@@ -260,6 +272,12 @@ class Remote:
         self.full_seq = 0
         self.cond = asyncio.Condition()
         self.controllers = 0
+        self.tasks: set = set()
+
+    def spawn(self, coro) -> None:
+        t = asyncio.create_task(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
 
     async def _send(self, obj: dict) -> bool:
         if self.sender is None:
@@ -273,11 +291,11 @@ class Remote:
     async def want_full(self, on: bool = True) -> None:
         await self._send({"cmd": "control", "on": on})
 
-    async def command(self, cmd: dict, timeout: float = 12) -> dict:
+    async def command(self, cmd: dict, timeout: float = 12, need: str = "control") -> dict:
         if self.sender is None:
             return {"ok": False, "msg": "ПК не в сети"}
-        if "control" not in self.caps:
-            return {"ok": False, "msg": "обнови программу на ПК до 0.1.6: «Проверить обновления»"}
+        if need not in self.caps:
+            return {"ok": False, "msg": "обнови программу на ПК: «Проверить обновления»"}
         now = time.monotonic()
         if now - self.last_cmd < 0.7:
             return {"ok": False, "msg": "слишком часто, подожди секунду"}
@@ -290,11 +308,18 @@ class Remote:
             if not await self._send({**cmd, "id": cid}):
                 return {"ok": False, "msg": "ПК не в сети"}
             res = await asyncio.wait_for(fut, timeout)
-            return {"ok": bool(res.get("ok")), "msg": str(res.get("msg", ""))[:200]}
+            out = {"ok": bool(res.get("ok")), "msg": str(res.get("msg", ""))[:200]}
+            if isinstance(res.get("tpl"), str) and len(res["tpl"]) < 200_000:
+                out["tpl"] = res["tpl"]
+            return out
         except asyncio.TimeoutError:
             return {"ok": False, "msg": "ПК не ответил"}
         finally:
             self.pending.pop(cid, None)
+
+    async def push_rules(self, new: str | None = None) -> None:
+        if "auto" in self.caps:
+            await self._send({"cmd": "rules", "rules": tgbot.store.rules, "new": new})
 
     def on_result(self, m: dict) -> None:
         fut = self.pending.get(m.get("id"))
@@ -443,6 +468,7 @@ async def ingest(ws: WebSocket):
     remote.sender = pub_send
     if remote.controllers:
         await remote.want_full()
+    await remote.push_rules()
 
     async def report():   # tell the desktop app how many people are watching
         while True:
@@ -461,6 +487,11 @@ async def ingest(ws: WebSocket):
                     m = json.loads(text)
                     if isinstance(m, dict) and m.get("type") == "result":
                         remote.on_result(m)
+                    elif isinstance(m, dict) and m.get("type") == "event":
+                        if BOT:
+                            remote.spawn(BOT.on_auto_event(m))
+                        else:
+                            log.info("авто-нажатие: %s", m.get("msg"))
                 except ValueError:
                     pass
                 continue
@@ -582,7 +613,7 @@ async def control(ws: WebSocket):
         async with lock:
             await asyncio.wait_for(ws.send_text(json.dumps(obj, ensure_ascii=False)), SEND_TIMEOUT)
 
-    await send({"type": "auth", "ok": True, "taps": tgbot.store.taps})
+    await send({"type": "auth", "ok": True, "taps": tgbot.store.taps, "rules": tgbot.store.rules_public()})
     remote.controllers += 1
     log.info("админ %s открыл управление", uid)
 
@@ -629,6 +660,37 @@ async def control(ws: WebSocket):
             elif kind == "del":
                 tgbot.store.del_tap(m.get("i"))
                 await send({"type": "taps", "taps": tgbot.store.taps})
+            elif kind == "learn":
+                rect = [frac(v) for v in (m.get("rect") or [])[:4]]
+                tap = [frac(v) for v in (m.get("tap") or [])[:2]]
+                name = " ".join(str(m.get("name", "")).split())[:24] or "Окно"
+                try:
+                    hours = min(24.0, max(0.0, float(m.get("timer_h") or 0)))
+                except (TypeError, ValueError):
+                    hours = 0.0
+                if len(rect) != 4 or None in rect or len(tap) != 2 or None in tap \
+                        or rect[2] - rect[0] < 0.02 or rect[3] - rect[1] < 0.02:
+                    await send({"type": "result", "ok": False, "msg": "обведи окно побольше"})
+                    continue
+                res = await remote.command({"cmd": "learn", "rect": rect}, need="auto")
+                if not res["ok"] or not res.get("tpl"):
+                    await send({"type": "result", "ok": False, "msg": res["msg"]})
+                    continue
+                rule = {"id": secrets.token_hex(4), "name": name, "rect": rect, "tap": tap,
+                        "timer_h": round(hours, 2), "tpl": res["tpl"]}
+                saved = tgbot.store.add_rule(rule)
+                if saved:
+                    await remote.push_rules(new=rule["id"])
+                log.info("админ %s: авто-нажатие «%s» %s", uid, name, "сохранено" if saved else "НЕ сохранено")
+                await send({"type": "rules", "rules": tgbot.store.rules_public(), "saved": saved,
+                            "new": rule["id"] if saved else None})
+            elif kind == "fire":
+                res = await remote.command({"cmd": "fire", "rule": str(m.get("id", ""))}, need="auto")
+                await send({"type": "result", **res})
+            elif kind == "rule_del":
+                if tgbot.store.del_rule(str(m.get("id", ""))):
+                    await remote.push_rules()
+                await send({"type": "rules", "rules": tgbot.store.rules_public()})
     except (WebSocketDisconnect, RuntimeError, OSError, ValueError, asyncio.TimeoutError):
         pass
     finally:

@@ -29,7 +29,7 @@ from pathlib import Path
 from tkinter import ttk
 
 import mss
-from PIL import Image, ImageDraw, ImageEnhance, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageStat, ImageTk
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidURI
 
@@ -39,7 +39,7 @@ except Exception:
     pystray = None
 
 APP_NAME = "Screen Relay"
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 GITHUB_REPO = "Satoros1/screen-relay"
 EXE_NAME = "ScreenRelay.exe"
 INSTANCE_PORT = 47613     # second launch tells the running copy to show its window
@@ -60,6 +60,7 @@ DEFAULTS = {
     "auto_launch": True,         # start it by itself when the window is missing
     "keep_awake": True,          # don't let the PC sleep / turn the screen off while streaming
     "remote_control": True,      # admins may click / press Esc in the streamed window from the bot
+    "auto_rules": [],            # auto-click rules from the server (cached so they work right after start)
     "hide_on_minimize": True,    # minimizing the emulator hides it off-screen instead (keeps streaming)
 }
 
@@ -656,6 +657,8 @@ class Capture(threading.Thread):
         self.full_until = 0.0         # admin's control view is open: also send the whole window
         self.full_jpeg = None
         self.full_seq = 0
+        self.last_img = None          # latest whole-window image (auto rules, learning)
+        self.auto = AutoRules(self)
 
     def get_jpeg(self):
         with self.lock:
@@ -678,6 +681,9 @@ class Capture(threading.Thread):
                 img, self.status = None, f"Ошибка захвата: {e}"
                 self.src.hwnd = None
             if img is not None:
+                self.last_img = img
+                if self.streaming:
+                    self.auto.check(img, t0)
                 if t0 - last_preview >= 0.25:
                     pv = img.copy()
                     pv.thumbnail((1000, 1000))
@@ -723,11 +729,144 @@ class Capture(threading.Thread):
             self.stop_ev.wait(max(0.005, 1 / fps - (time.monotonic() - t0)))
 
 
+# ============================================================ auto-click: "this popup appeared -> press its button"
+TPL_W = 64            # templates are stored this wide (grayscale), height keeps the aspect ratio
+MATCH_DIFF = 16.0     # mean pixel difference (0..255) below which the popup counts as "on screen"
+
+
+def tpl_region(img: Image.Image, rect) -> Image.Image:
+    w, h = img.size
+    x0, y0 = int(rect[0] * w), int(rect[1] * h)
+    return img.crop((x0, y0, max(x0 + 2, int(rect[2] * w)), max(y0 + 2, int(rect[3] * h))))
+
+
+def make_template(img: Image.Image, rect) -> Image.Image:
+    reg = tpl_region(img, rect).convert("L")
+    th = max(8, min(128, round(reg.height * TPL_W / max(1, reg.width))))
+    return reg.resize((TPL_W, th), Image.BILINEAR).filter(ImageFilter.BoxBlur(1))
+
+
+def tpl_diff(img: Image.Image, rect, tpl: Image.Image) -> float:
+    reg = tpl_region(img, rect).convert("L").resize(tpl.size, Image.BILINEAR).filter(ImageFilter.BoxBlur(1))
+    return ImageStat.Stat(ImageChops.difference(reg, tpl)).mean[0]
+
+
+def tpl_to_b64(tpl: Image.Image) -> str:
+    buf = io.BytesIO()
+    tpl.save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def tpl_from_b64(data: str) -> Image.Image:
+    return Image.open(io.BytesIO(base64.b64decode(data))).convert("L")
+
+
+class AutoRules:
+    """Watches the whole window for learned popups; when one shows up, clicks its button,
+    checks that it went away and queues an event for the server (which runs the timer)."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.rules: list[dict] = []
+        self.state: dict[str, dict] = {}
+        self.busy = False
+        self.events: queue.Queue = queue.Queue(maxsize=20)
+        self.last_check = 0.0
+        self.last_msg = ""
+        self.set(cap.cfg.get("auto_rules") or [])
+
+    def set(self, raw: list, unarm: str | None = None) -> None:
+        rules = []
+        for r in raw or []:
+            try:
+                rect = [float(v) for v in r["rect"]]
+                tap = [float(v) for v in r["tap"]]
+                rules.append({"id": str(r["id"]), "name": str(r.get("name", "?")), "rect": rect, "tap": tap,
+                              "tpl": tpl_from_b64(r["tpl"])})
+            except Exception:
+                continue
+        old = self.state
+        self.state = {r["id"]: old.get(r["id"], {"hits": 0, "miss": 0, "armed": True}) for r in rules}
+        if unarm in self.state:          # just learned while the popup is open: wait for the next time
+            self.state[unarm]["armed"] = False
+        self.rules = rules
+
+    def find(self, rule_id: str) -> dict | None:
+        return next((r for r in self.rules if r["id"] == rule_id), None)
+
+    def check(self, img: Image.Image, now: float) -> None:
+        if not self.rules or self.busy or now - self.last_check < 1.0:
+            return
+        self.last_check = now
+        for r in self.rules:
+            st = self.state.setdefault(r["id"], {"hits": 0, "miss": 0, "armed": True})
+            try:
+                matched = tpl_diff(img, r["rect"], r["tpl"]) < MATCH_DIFF
+            except Exception:
+                matched = False
+            if matched:
+                st["hits"] += 1
+                st["miss"] = 0
+            else:
+                st["hits"] = 0
+                st["miss"] += 1
+                if st["miss"] >= 3:                    # it was gone for a while: next appearance counts again
+                    st["armed"] = True
+            if matched and st["hits"] >= 2 and st["armed"]:
+                st["armed"] = False
+                self.fire(r)
+                return
+
+    def fire(self, rule: dict) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        threading.Thread(target=self._fire, args=(rule,), daemon=True).start()
+        return True
+
+    def still_there(self, rule: dict) -> bool:
+        img = self.cap.last_img
+        return img is not None and tpl_diff(img, rule["rect"], rule["tpl"]) < MATCH_DIFF
+
+    def _fire(self, rule: dict) -> None:
+        ok, msg = False, ""
+        try:
+            if not self.cap.cfg.get("remote_control", True):
+                msg = "нажатия выключены в программе (галочка «Разрешить нажатия из бота»)"
+            else:
+                for _ in range(3):
+                    _, msg = self.cap.src.remote_input("tap", rule["tap"][0], rule["tap"][1])
+                    for _ in range(8):                 # give the app up to 2 s to close the popup
+                        time.sleep(0.25)
+                        if not self.still_there(rule):
+                            ok, msg = True, "нажал, окно закрылось"
+                            break
+                    if ok:
+                        break
+                if not ok:
+                    msg = f"окно не закрылось ({msg})"
+        except Exception as e:
+            msg = f"ошибка: {e}"
+        finally:
+            self.last_msg = f"{time.strftime('%H:%M:%S')} авто «{rule['name']}»: {msg}"
+            ev = {"type": "event", "rule": rule["id"], "ok": ok, "msg": msg, "at": time.time()}
+            try:
+                self.events.put_nowait(ev)
+            except queue.Full:
+                try:
+                    self.events.get_nowait()
+                    self.events.put_nowait(ev)
+                except queue.Empty:
+                    pass
+            self.busy = False
+
+
 # ============================================================ network
 class Net(threading.Thread):
-    def __init__(self, cap: Capture, server: str, token: str):
+    def __init__(self, cap: Capture, server: str, token: str, on_rules=None):
         super().__init__(daemon=True)
         self.cap, self.server, self.token = cap, server.strip(), token.strip()
+        self.on_rules = on_rules      # GUI callback: cache the rules in the settings
         self.stop_ev = threading.Event()
         self.state = "connecting"     # connecting | live | retry | fatal
         self.message = "Подключение…"
@@ -770,6 +909,44 @@ class Net(threading.Thread):
         if cmd == "control":
             self.cap.full_until = time.monotonic() + 30 if m.get("on") else 0.0
             return
+        if cmd == "rules":
+            raw = m.get("rules") or []
+            self.cap.auto.set(raw, unarm=m.get("new"))
+            if self.on_rules:
+                self.on_rules(raw)
+            return
+        if cmd in ("learn", "fire"):
+            ok, msg, extra = False, "", {}
+            if cmd == "learn":
+                img = self.cap.last_img
+                try:
+                    rect = [float(v) for v in m.get("rect", [])]
+                    valid = len(rect) == 4 and 0 <= rect[0] < rect[2] <= 1 and 0 <= rect[1] < rect[3] <= 1
+                except (TypeError, ValueError):
+                    valid = False
+                if img is None:
+                    msg = "нет картинки окна - трансляция идёт?"
+                elif not valid:
+                    msg = "неправильная область"
+                else:
+                    tpl = make_template(img, rect)
+                    if ImageStat.Stat(tpl).stddev[0] < 10:
+                        msg = "в обведённой области почти ничего нет - обведи окно вместе с текстом и кнопкой"
+                    else:
+                        ok, msg, extra = True, "запомнил окно", {"tpl": tpl_to_b64(tpl)}
+            else:
+                rule = self.cap.auto.find(str(m.get("rule", "")))
+                if not rule:
+                    msg = "правило ещё не дошло до ПК, попробуй через пару секунд"
+                elif self.cap.auto.fire(rule):
+                    ok, msg = True, "нажимаю"
+                else:
+                    msg = "уже нажимаю"
+            try:
+                await ws.send(json.dumps({"type": "result", "id": m.get("id"), "ok": ok, "msg": msg, **extra}))
+            except Exception:
+                pass
+            return
         if cmd not in ("tap", "key"):
             return
         if not self.cap.cfg.get("remote_control", True):
@@ -798,7 +975,7 @@ class Net(threading.Thread):
                 self.state, self.message = "connecting", "Подключение к серверу…"
                 async with connect(self.server, max_size=None, ping_interval=20,
                                    open_timeout=10, close_timeout=2) as ws:
-                    await ws.send(json.dumps({"token": self.token, "v": APP_VERSION, "caps": ["control"]}))
+                    await ws.send(json.dumps({"token": self.token, "v": APP_VERSION, "caps": ["control", "auto"]}))
                     reply = json.loads(await asyncio.wait_for(ws.recv(), 10))
                     if not reply.get("ok"):
                         raise ConnectionError("сервер не принял токен")
@@ -810,6 +987,12 @@ class Net(threading.Thread):
                         if reader.done():
                             reader.result()          # raises if the connection died
                             raise ConnectionError("соединение закрыто")
+                        while True:                       # auto-click events -> server (timer)
+                            try:
+                                ev = self.cap.auto.events.get_nowait()
+                            except queue.Empty:
+                                break
+                            await asyncio.wait_for(ws.send(json.dumps(ev)), 20)
                         fseq, fdata = self.cap.get_full()
                         if fdata and fseq != last_full:
                             last_full = fseq
@@ -1369,7 +1552,7 @@ class App:
             self.set_state("Выбери окно", "#e74c3c")
             return
         self.cap.streaming = True
-        self.net = Net(self.cap, self.cfg["server"], self.cfg["token"])
+        self.net = self.make_net()
         self.net.start()
         self.btn.config(text="■  Остановить")
         for w in (self.server_entry, self.token_entry):
@@ -1394,15 +1577,25 @@ class App:
     def set_state(self, text, color):
         self.state_label.config(text=f"● {text}", fg=color)
 
+    def make_net(self) -> Net:
+        return Net(self.cap, self.cfg["server"], self.cfg["token"],
+                   on_rules=lambda raw: self.ui_q.put(lambda: self.save_rules(raw)))
+
+    def save_rules(self, raw: list):
+        self.cfg["auto_rules"] = raw
+        self.push_cfg()
+
     def health_check(self):
         """Self-healing: restart a dead capture thread, reconnect a stuck upload, adapt quality."""
         now = time.monotonic()
         if not self.cap.is_alive() or now - self.cap.heartbeat > 15:
             streaming = self.cap.streaming
             self.cap.stop_ev.set()
-            old_src = self.cap.src
+            old_src, old_auto = self.cap.src, self.cap.auto
             self.cap = Capture(self.cfg)
             self.cap.src = old_src
+            self.cap.auto = old_auto
+            old_auto.cap = self.cap
             self.cap.streaming = streaming
             self.cap.start()
             if self.net:
@@ -1453,6 +1646,10 @@ class App:
                 w, h = self.cap.out_size
                 auto = f" · авто-качество {int(self.cap.scale * 100)}% (медленный интернет)" if self.cap.scale < 0.99 else ""
                 remote = f" · {net.last_remote}" if net.last_remote else ""
+                if self.cap.auto.rules:
+                    remote += f" · авто-нажатий: {len(self.cap.auto.rules)}"
+                if self.cap.auto.last_msg:
+                    remote += f" · {self.cap.auto.last_msg}"
                 self.info_label.config(text=f"{src_status}" + (f" · кадр {w}×{h}" if w else "") + auto + remote)
             else:
                 self.info_label.config(text=src_status)
@@ -1537,7 +1734,7 @@ class App:
         self.cap.src.hwnd = None            # look for the window again
         if self.net:
             self.net.stop()
-            self.net = Net(self.cap, self.cfg["server"], self.cfg["token"])
+            self.net = self.make_net()
             self.net.start()
             self.last_stats = (time.monotonic(), 0, 0)
         self.set_state(why, "#e67e22")
@@ -1761,6 +1958,32 @@ class App:
         threading.Thread(target=loop, daemon=True).start()
 
 
+def selftest_match() -> str:
+    """Popup detection must see the popup, ignore the screen under it and survive small differences."""
+    def screen(popup: bool, shift=0) -> Image.Image:
+        im = Image.new("RGB", (540, 960), "#ff7a00")
+        d = ImageDraw.Draw(im)
+        for i in range(12):
+            d.text((40, 120 + i * 60), f"Stat {i}: {i * 37 % 91}", fill="#ffffff")
+        if popup:
+            d.rectangle((30, 560 + shift, 510, 800 + shift), fill="#ffffff")
+            d.text((170, 590 + shift), "ENJOY YOUR WORKOUT!", fill="#000000")
+            d.text((60, 630 + shift), "The gate remains open for a maximum of 10 seconds.", fill="#333333")
+            d.rounded_rectangle((50, 700 + shift, 490, 770 + shift), radius=12, fill="#5b2ca0")
+            d.text((250, 728 + shift), "GOT IT", fill="#ffffff")
+        return im
+
+    rect = [30 / 540, 560 / 960, 510 / 540, 800 / 960]
+    tpl = make_template(screen(True), rect)
+    tpl = tpl_from_b64(tpl_to_b64(tpl))
+    same = tpl_diff(screen(True, shift=2), rect, tpl)
+    gone = tpl_diff(screen(False), rect, tpl)
+    scaled = tpl_diff(screen(True).resize((720, 1280)), rect, tpl)
+    assert same < MATCH_DIFF and scaled < MATCH_DIFF, f"popup not recognized same={same:.1f} scaled={scaled:.1f}"
+    assert gone > MATCH_DIFF * 2, f"false match gone={gone:.1f}"
+    return f"ok({same:.1f}/{scaled:.1f}/{gone:.1f})"
+
+
 def selftest() -> int:
     """Used by the GitHub build to make sure everything got packed into the exe."""
     log = Path(sys.executable if getattr(sys, "frozen", False) else __file__).with_name("selftest.log")
@@ -1777,7 +2000,7 @@ def selftest() -> int:
         img.save(io.BytesIO(), "JPEG")
         make_icon()
         assert decode_code("sr1:eyJzIjoid3NzOi8veC95IiwidCI6ImFiYyJ9") == ("wss://x/y", "abc"), "connection code"
-        extra = ""
+        extra = " match=" + selftest_match()
         if IS_WIN:
             set_autostart(True)
             assert startup_file().exists(), "autostart shortcut not created"
